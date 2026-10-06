@@ -1,0 +1,131 @@
+---
+title: "K64 Cooperative Scheduler and Task Model"
+sidebarTitle: "Scheduler"
+description: "K64's priority-aware cooperative scheduler drives async driver and service worker tasks using PIT timer ticks, with aging-based fairness and yield/sleep support."
+---
+
+K64's scheduler is the mechanism that keeps async drivers and services running after `k64_kernel_main()` completes initialization. It is driven by PIT timer interrupts and uses a priority-aware picking algorithm with aging-based fairness — higher-priority work is preferred, but no runnable task is permanently starved. This page describes how the scheduler works, what the task model looks like, and what the scheduler is not.
+
+## How the Scheduler Works
+
+The scheduler is initialized during step 10 of `k64_kernel_main()` by `k64_sched_init()`. The PIT is initialized at step 14 (`k64_pit_init(k64_config.pit_hz)`), and interrupts are unmasked at step 18 (`sti`). From that point on, PIT IRQ 0 fires at the configured tick rate (default: 1000 Hz) and drives all task switching.
+
+### Task States
+
+Tasks move through a defined set of states tracked in `k64_task_state_t`:
+
+```c
+typedef enum {
+    K64_TASK_STATE_UNUSED  = 0,  /* Slot is free in the task table */
+    K64_TASK_STATE_READY   = 1,  /* Runnable, waiting to be scheduled */
+    K64_TASK_STATE_RUNNING = 2,  /* Currently executing */
+    K64_TASK_STATE_BLOCKED = 3,  /* Sleeping or waiting on a condition */
+    K64_TASK_STATE_ZOMBIE  = 4,  /* Exited, awaiting reap */
+} k64_task_state_t;
+```
+
+### Task Structure
+
+Each task is represented by a `k64_task_t`:
+
+```c
+typedef struct k64_task {
+    uint64_t         id;
+    uint64_t         rsp;              /* Saved stack pointer */
+    uint64_t         cr3;              /* Address space root */
+    uint64_t         sleep_until_tick; /* Wake time for sleeping tasks */
+    uint64_t         stack_frame;
+    k64_task_state_t state;
+    int              priority;
+    uint32_t         base_timeslice;   /* Base tick slice for this task */
+    uint32_t         remaining_ticks;  /* Ticks remaining in current slice */
+    uint64_t         runtime_ticks;    /* Total ticks this task has run */
+    uint64_t         wait_ticks;       /* Ticks accumulated while waiting */
+    struct k64_task* next;
+} k64_task_t;
+```
+
+### Async Workers, Yield, and Sleep
+
+Async services and async drivers are launched as worker tasks via `k64_task_create()` or `k64_task_create_arg()`. Worker tasks can:
+
+- **Yield** (`k64_sched_yield()`): voluntarily give up the CPU and return to the `READY` state immediately.
+- **Sleep** (`k64_sched_sleep(ticks)`): block until at least `ticks` PIT ticks have elapsed, then return to `READY`.
+- **Block** (`k64_sched_block_current()`): enter `BLOCKED` state and remain there until explicitly woken by `k64_sched_wake_task()`.
+
+### Priority and Aging
+
+When a timer IRQ fires, `k64_sched_handle_timer()` is called with the current stack pointer. The scheduler saves the interrupted context, increments wait ticks for all non-running tasks, and picks the next task to run.
+
+The picker favors higher-priority tasks but uses accumulated `wait_ticks` to prevent starvation: a lower-priority task that has waited a long time accumulates enough weight to eventually be selected over a higher-priority task that would otherwise monopolize the CPU. This is an aging-based fairness policy applied within the cooperative model.
+
+### Task Creation API
+
+```c
+/* Create a task with default priority. */
+k64_task_t* k64_task_create(void (*entry)(void));
+
+/* Create a task with explicit priority. */
+k64_task_t* k64_task_create_ex(void (*entry)(void), int priority);
+
+/* Create a task with an argument, priority, and a specific CR3. */
+k64_task_t* k64_task_create_arg(void (*entry)(void*), void* arg, int priority, uint64_t cr3);
+```
+
+Tasks that carry a non-zero `cr3` run under a private address space — this is how ELF-backed service and driver workers execute within their VMM-allocated slots.
+
+## The `sched` Shell Command
+
+The built-in `sched` shell command prints the current scheduler state. The output columns are:
+
+| Column | Meaning |
+|---|---|
+| State | Task state: `READY`, `RUNNING`, `BLOCKED`, or `ZOMBIE` |
+| `*` marker | Present on the currently executing task |
+| Priority | Numeric priority value (higher = preferred) |
+| Remaining/Base slice | `remaining_ticks / base_timeslice` — how many ticks remain in this scheduling round vs. the task's normal slice |
+| Run ticks | Total PIT ticks this task has been in the `RUNNING` state |
+| Wait ticks | Total PIT ticks this task has accumulated in the `READY` state without running |
+
+<Tip>
+Use `sched` to inspect task priorities, wait-tick accumulation, and overall scheduler fairness at runtime. Use `task` to inspect a specific task's detail. High `wait_ticks` on a task relative to its `run_ticks` indicates it is being outcompeted by higher-priority work.
+</Tip>
+
+## After Initialization Completes
+
+Once `k64_kernel_main()` finishes all 19 initialization steps and executes `sti`, three things happen:
+
+1. **PIT drives the scheduler.** Timer IRQ 0 fires at `pit_hz` (default 1000 Hz), invoking `k64_sched_handle_timer()` through the IRQ stub chain. Task switching begins.
+2. **Async drivers and services run as scheduled worker tasks.** The `screen`, `keyboard`, `fs`, and network drivers, plus the `shell` and other async services, are running as `k64_task_t` entries in the task table.
+3. **The CPU halts between ticks.** The main `for(;;)` loop in `k64_kernel_main()` calls `k64_modules_poll_async()` and `k64_system_poll_async()` (now largely compatibility stubs) and then idles. The CPU executes `hlt` until the next interrupt arrives.
+
+The kernel has no foreground shell loop. The shell itself is an async service task.
+
+## User Process Visibility: `ps`
+
+For user ELF processes launched from `/ex`, the `ps` shell command shows the process table:
+
+| Column | Meaning |
+|---|---|
+| PID | Stable kernel-assigned process ID |
+| PPID | Parent PID (the spawning process or service) |
+| State | `RUNNING`, `ZOMBIE`, or other process states |
+| Exit code | Final exit code (for `ZOMBIE` entries) |
+| Runtime ticks | Total PIT ticks the process has been scheduled |
+| Fault metadata | Fault vector and faulting RIP, if the process terminated on a fault |
+| Image path | Filesystem path of the loaded ELF (`/ex/...`) |
+
+`ZOMBIE` records remain visible in `ps` output until a parent process calls `waitpid()` to reap them.
+
+## What the Scheduler Is Not
+
+<Note>
+The K64 scheduler is a cooperative priority-aging task dispatcher for kernel-side workers. It is not a full Unix-style process runtime. Specifically:
+
+- **No `fork`/`exec`/`wait` process tree**: services and drivers are registry-backed tasks, not Unix processes.
+- **No timer-preemptive ring-3 context switching**: user ELF processes run cooperatively and yield back to the kernel at explicit points. Full per-user-task kernel stacks, saved user trap frames, and timer-preemptive ring-3 scheduling remain future work.
+- **No POSIX signals**: there is no signal delivery path or `kill()`/`raise()` mechanism.
+- **No `nice`/`renice`**: priority is set at task creation time and is not adjusted through user commands.
+
+The child execution path is cooperative-asynchronous: queued children can run from explicit scheduler points such as `sched.yield`, `sched.sleep`, and the shell/service poll loop before the parent calls `waitpid()`. Blocking `waitpid()` can still enter and collect a specific child. This is intentionally small but real.
+</Note>

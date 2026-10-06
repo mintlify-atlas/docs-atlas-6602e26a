@@ -1,0 +1,231 @@
+---
+title: "K64 Driver Model: .k64m Binary Artifacts"
+sidebarTitle: "Driver Model"
+description: "K64 drivers are .k64m binary artifacts registered in a runtime registry of up to 32 entries. Covers the legacy external format, native rootfs format, lifecycle, and driverctl commands."
+---
+
+K64 drivers are the lowest runtime layer above the kernel core. Every hardware abstraction and low-level service provider — screen output, keyboard input, filesystem mounting, and Ethernet I/O — is modelled as a named driver entry registered in a fixed runtime table. Drivers are packaged as `.k64m` binary artifacts, either compiled directly into the kernel image as built-ins or loaded from `/k64m` on the mounted K64XFS root. The `driverctl` service gives you a live control plane to list, start, stop, and restart any registered driver from the shell.
+
+## Driver Registry
+
+The registry holds up to **32 entries**. Driver IDs are assigned sequentially starting at **4000**. Built-in drivers are registered first during kernel bring-up; rootfs-native `.k64m` files are appended after the filesystem driver has mounted K64XFS.
+
+## `k64_driver_t` Fields
+
+Each registry entry is a `k64_driver_t` struct (defined in `k64_modules.h`):
+
+```c
+typedef struct k64_driver {
+    uint64_t             id;
+    char                 name[32];
+    char                 source[48];
+    uint32_t             flags;
+    uint8_t              type;
+    uint32_t             priority;
+    k64_driver_state_t   state;
+    bool                 controllable;
+    uint64_t             start_count;
+    uint64_t             stop_count;
+    uint64_t             last_start_tick;
+    uint64_t             last_poll_tick;
+    k64_driver_start_fn  start;
+    k64_driver_stop_fn   stop;
+    k64_driver_poll_fn   poll;
+    k64_task_t*          task;
+    void*                context;
+} k64_driver_t;
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `uint64_t` | Unique driver ID, starting at 4000 |
+| `name` | `char[32]` | Human-readable driver name (e.g. `screen`, `rtl8139`) |
+| `source` | `char[48]` | Source path string, e.g. `k64m/screen.k64m` |
+| `flags` | `uint32_t` | Bitmask of `K64_MODULE_FLAG_*` values |
+| `type` | `uint8_t` | Module type: `DRIVER`, `FS`, or `SERVICE` |
+| `priority` | `uint32_t` | Scheduler priority for async worker task |
+| `state` | `k64_driver_state_t` | `STOPPED` or `RUNNING` |
+| `controllable` | `bool` | Whether `driverctl start/stop/restart` is permitted |
+| `start_count` | `uint64_t` | Total number of successful starts |
+| `stop_count` | `uint64_t` | Total number of stops |
+| `last_start_tick` | `uint64_t` | PIT tick at which the driver last started |
+| `last_poll_tick` | `uint64_t` | PIT tick at which the driver was last polled |
+| `start` | `k64_driver_start_fn` | Called to start the driver; returns `true` on success |
+| `stop` | `k64_driver_stop_fn` | Called to stop the driver |
+| `poll` | `k64_driver_poll_fn` | Optional; called from the async worker on each scheduler tick |
+| `task` | `k64_task_t*` | Scheduler task handle for async drivers |
+| `context` | `void*` | Optional driver-private data pointer |
+
+## Callback Signatures
+
+Callbacks follow these exact signatures from `k64_modules.h`:
+
+```c
+typedef bool (*k64_driver_start_fn)(struct k64_driver* driver);
+typedef void (*k64_driver_stop_fn)(struct k64_driver* driver);
+typedef void (*k64_driver_poll_fn)(struct k64_driver* driver, uint64_t now_ticks);
+```
+
+- `start` must return `true` when hardware initialisation succeeds. A `false` return leaves the driver in `STOPPED` state.
+- `stop` should cleanly shut down the hardware and release resources.
+- `poll` receives the current PIT tick counter. It is only invoked when the driver carries `K64_MODULE_FLAG_ASYNC` and its scheduler task is running.
+
+## Module Flags
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `K64_MODULE_FLAG_ASYNC` | `1 << 0` | Launch driver as a scheduled async worker task rather than a one-shot start call |
+| `K64_MODULE_FLAG_AUTOSTART` | `1 << 1` | Start the driver automatically during the bootstrap phase |
+
+## Built-in Drivers
+
+The following drivers are compiled directly into the kernel image and registered by `k64m_register_builtin_drivers()` in `k64m/k64m_builtin.c`:
+
+| Name | Source | Type | Flags | Description |
+|---|---|---|---|---|
+| `ata` | `k64m/ata.k64m` | DRIVER | AUTOSTART | ATA PIO block device driver; probes primary and secondary IDE channels |
+| `screen` | `k64m/screen.k64m` | DRIVER | AUTOSTART | VGA text-mode terminal screen driver |
+| `keyboard` | `k64m/keyboard.k64m` | DRIVER | AUTOSTART | PS/2 keyboard driver |
+| `fs` | `k64m/fs.k64m` | FS | AUTOSTART | K64XFS filesystem driver; mounts ATA disk root or Multiboot `root.xfs` fallback |
+| `rtl8139` | `k64m/rtl8139.k64m` | DRIVER | AUTOSTART \| ASYNC | RTL8139 Ethernet driver for QEMU and legacy VMs |
+| `e1000` | `k64m/e1000.k64m` | DRIVER | AUTOSTART \| ASYNC | Intel e1000 Ethernet driver for VMware-compatible VMs |
+
+After the filesystem mounts successfully, the rootfs loader additionally scans `/k64m` and registers any `.k64m` files it finds there.
+
+## Driver Lifecycle
+
+<Steps>
+  <Step title="Registry initialisation">
+    `k64_modules_registry_init()` zeroes the driver table and sets up the ID counter starting at 4000.
+  </Step>
+  <Step title="Built-in registration">
+    `k64m_register_builtin_drivers()` calls `k64_modules_register_driver()` for each compiled-in driver. These receive a `source` string of `k64m/<name>.k64m` as metadata but their implementation lives in the kernel image.
+  </Step>
+  <Step title="External Multiboot module scan">
+    Any Multiboot module whose payload begins with a valid `K64M` magic header is scanned and registered on the legacy external path. This path still exists for compatibility but is no longer the default extensibility model.
+  </Step>
+  <Step title="Autostart">
+    `k64_modules_bootstrap()` iterates the registry and calls `start` on every driver whose flags include `K64_MODULE_FLAG_AUTOSTART`. The `screen`, `keyboard`, `fs`, `ata`, `rtl8139`, and `e1000` built-ins all autostart.
+  </Step>
+  <Step title="Async worker launch">
+    Drivers carrying `K64_MODULE_FLAG_ASYNC` are registered as scheduler tasks. The PIT-driven scheduler calls their `poll` callback on each tick, which is how `rtl8139` and `e1000` process received Ethernet frames.
+  </Step>
+</Steps>
+
+## Two Loading Paths
+
+### Legacy External Format (Multiboot)
+
+External `.k64m` modules can be delivered as Multiboot modules. The kernel recognises them by a packed header at the start of the module payload:
+
+```c
+typedef struct {
+    uint32_t magic;        /* must equal K64_MODULE_MAGIC (0x4B36344D, "K64M") */
+    uint8_t  version;
+    uint8_t  type;
+    uint16_t flags;
+    uint64_t entry_offset; /* entry point = module_base + entry_offset            */
+    char     name[32];
+} __attribute__((packed)) k64_module_header_t;
+```
+
+<Note>
+`magic` must equal `K64_MODULE_MAGIC` (`0x4B36344D` — the ASCII bytes `K64M`). The entry point is computed as `module_base + entry_offset`. This path remains in the tree for compatibility but is no longer the preferred way to extend the driver layer.
+</Note>
+
+### Native Rootfs Format (`/k64m`)
+
+After `fs.k64m` mounts K64XFS, `k64_modules_load_rootfs()` scans `/k64m` for binary `.k64m` files. Each file is a packed binary artifact — not a text config — encoding:
+
+| Field | Description |
+|---|---|
+| `K64M` magic | 4-byte identifier (`0x4B36344D`) |
+| Artifact version | Format revision byte |
+| Execution kind | `builtin` (stub; skip) or `elf` (load via ELF loader) |
+| Module type | `DRIVER`, `FS`, or `SERVICE` |
+| Flags | `K64_MODULE_FLAG_*` bitmask |
+| Priority | Scheduler priority |
+| Name | Driver name string (up to 32 bytes) |
+| Entry path | Optional ELF path, e.g. `/ex/hello.elf` |
+
+These binary files are compiled from human-readable source definitions in `k64m_def/*.drv`. For example, `k64m_def/hello-driver.drv` contains:
+
+```text
+name=hello-driver
+kind=elf
+type=driver
+entry=/ex/hello.elf
+```
+
+This produces `/k64m/hello-driver.k64m` in the staged rootfs. When the rootfs loader encounters it, it resolves `/ex/hello.elf` through the ELF loader and registers the resulting entry point as the driver's `start` callback.
+
+### Built-in vs ELF-backed `.k64m`
+
+<Info>
+Built-in `.k64m` files (such as `screen.k64m`, `fs.k64m`) are metadata stubs. The rootfs loader detects them as `kind=builtin` and skips them — the implementation is already compiled into the kernel image. Only `kind=elf` entries trigger ELF loading and a new driver registration.
+</Info>
+
+## Registering a Driver
+
+New drivers are added to the registry by calling:
+
+```c
+k64_driver_t* k64_modules_register_driver(
+    const char*         name,
+    const char*         source,
+    uint8_t             type,
+    uint32_t            flags,
+    uint32_t            priority,
+    bool                controllable,
+    k64_driver_start_fn start,
+    k64_driver_stop_fn  stop,
+    k64_driver_poll_fn  poll,
+    void*               context
+);
+```
+
+| Parameter | Description |
+|---|---|
+| `name` | Short driver name used in `driverctl list` output |
+| `source` | Source path string for informational display |
+| `type` | `K64_MODULE_TYPE_DRIVER`, `K64_MODULE_TYPE_FS`, or `K64_MODULE_TYPE_SERVICE` |
+| `flags` | `K64_MODULE_FLAG_ASYNC` and/or `K64_MODULE_FLAG_AUTOSTART` |
+| `priority` | Scheduler task priority (higher value = higher priority) |
+| `controllable` | If `true`, the driver can be managed via `driverctl start/stop/restart` |
+| `start` | Start callback; receives a pointer to the `k64_driver_t` entry |
+| `stop` | Stop callback |
+| `poll` | Poll callback, or `NULL` for non-async drivers |
+| `context` | Optional private data pointer stored in `driver->context` |
+
+Returns a pointer to the registered `k64_driver_t`, or `NULL` if the registry is full.
+
+## `driverctl` Commands
+
+The `driverctl` service is the runtime control plane for driver management. All write operations are **root-only**.
+
+| Command | Description |
+|---|---|
+| `driverctl list` | List all registered drivers with ID, state, name, and source path |
+| `driverctl list stopped` | List only drivers currently in `STOPPED` state |
+| `driverctl stopped` | Alias for `driverctl list stopped` |
+| `driverctl start <id>` | Start the driver with the given numeric ID |
+| `driverctl stop <id>` | Stop the driver with the given numeric ID |
+| `driverctl restart <id>` | Stop then immediately restart the driver |
+
+<Warning>
+`driverctl start/stop/restart` require effective root. Non-root users can run `driverctl list` and `driverctl stopped` but will receive `permission denied` for any mutation.
+</Warning>
+
+The `driverctl list` output columns are:
+
+```text
+ID    STATE    NAME              SOURCE
+4000  running  screen            k64m/screen.k64m
+4001  running  keyboard          k64m/keyboard.k64m
+4002  running  fs                k64m/fs.k64m
+...
+```
+
+<Tip>
+To inspect a driver's numeric ID before calling `driverctl start`, run `driverctl list` first. IDs begin at 4000 and increment by one for each registered driver in registration order.
+</Tip>

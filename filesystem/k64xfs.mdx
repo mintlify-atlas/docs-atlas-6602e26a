@@ -1,0 +1,267 @@
+---
+title: "K64XFS: Block-Backed Filesystem Format and Architecture"
+sidebarTitle: "K64XFS"
+description: "K64XFS is K64's custom 4096-byte block filesystem with versioned superblock, inode/block bitmaps, direct extents, 64-block cache, POSIX-like metadata, and a metadata journal skeleton."
+---
+
+K64XFS is the native filesystem format for the K64 kernel. It is a block-backed, fixed-block-size filesystem designed to be readable by GRUB at boot time, writable by the kernel at runtime, and buildable deterministically on the host from a staged directory tree. K64XFS is used by the kernel's runtime filesystem driver, the GRUB-side filesystem module, the persistent disk image attached as `build/root.disk` in the default QEMU flow, and the ISO fallback module `root.xfs`. Every root path that K64 operates on — boot artifacts, service binaries, user files — lives inside a K64XFS volume.
+
+## Design Goals
+
+K64XFS was designed with a specific set of priorities in mind:
+
+- **GRUB-readable boot roots** — the same image that the kernel mounts at runtime can be mounted by GRUB directly, so `/boot/grub/grub.cfg` and the kernel ELF are read from the filesystem rather than from separate ISO structures.
+- **Block-backed persistence** — mutations such as file writes, directory creation, and renames are committed to the underlying block device and survive reboot when the system boots from an attached disk image.
+- **Deterministic host-side image generation** — `tools/mk_k64xfs.py` produces byte-for-byte reproducible images from a source directory tree, making the build fully scriptable.
+- **Checked metadata** — the superblock, every inode, and every directory entry carry CRC32 checksums. The kernel validates these on read and rejects images with corrupt or mismatched metadata.
+- **POSIX-like mode/UID/GID** — inodes store 16-bit mode fields, 32-bit UID and GID values, timestamps, and generation counters, giving the permission and `stat` subsystems real on-disk backing.
+- **Service-call-friendly file operations** — the public API exposed through `k64_fs.h` provides named functions for every mutation (read, write, append, truncate, move, copy, remove) so services and syscall handlers can operate on files without reaching into filesystem internals.
+- **Incremental growth toward a stronger journaled filesystem** — the journal area is reserved in the on-disk layout, and the journal API skeleton is in place; full crash recovery is a planned future milestone.
+
+---
+
+## On-Image Layout
+
+K64XFS v1 uses fixed 4096-byte filesystem blocks. The first few block numbers are always reserved for metadata, followed by the inode table, and then data extents.
+
+| Block range | Contents |
+|---|---|
+| Block 0 | Checksummed superblock (magic, version, geometry, feature flags, UUID, label, root inode, mount state, checksum) |
+| Block 1 | Inode bitmap (one bit per inode slot; up to 512 inodes in v1) |
+| Block 2 | Block bitmap (one bit per filesystem block) |
+| Blocks 3–10 | Journal area (32 blocks reserved; `K64XFS_JOURNAL_BLOCKS = 32`) |
+| Blocks 35 onward | Fixed inode table (size determined by `MAX_INODES × sizeof(inode)` rounded up to block boundaries) |
+| Remaining blocks | File and directory data extents |
+
+<Note>
+The `data_start` field in the superblock records the first block available for file data. Everything before it is reserved for metadata and the inode table. Blocks below `data_start` are always marked used in the block bitmap.
+</Note>
+
+---
+
+## Superblock Fields
+
+The superblock occupies exactly one 4096-byte block and is always at block 0. All fields are little-endian packed (`__attribute__((packed))`).
+
+| Field | Type | Description |
+|---|---|---|
+| `magic` | `char[8]` | Must be `"K64XFS1\0"` (`K64_XFS_MAGIC`) |
+| `version_major` | `uint16_t` | Format major version; currently `1` |
+| `version_minor` | `uint16_t` | Format minor version; currently `0` |
+| `block_size` | `uint32_t` | Always `4096` |
+| `total_blocks` | `uint64_t` | Total number of 4096-byte blocks in the image |
+| `free_blocks` | `uint64_t` | Number of unallocated data blocks |
+| `inode_table_start` | `uint64_t` | First block of the inode table |
+| `inode_table_blocks` | `uint64_t` | Number of blocks in the inode table |
+| `block_bitmap_start` | `uint64_t` | Block number of the block bitmap (always `2`) |
+| `block_bitmap_blocks` | `uint64_t` | Number of blocks occupied by the block bitmap |
+| `inode_bitmap_start` | `uint64_t` | Block number of the inode bitmap (always `1`) |
+| `inode_bitmap_blocks` | `uint64_t` | Number of blocks occupied by the inode bitmap |
+| `journal_start` | `uint64_t` | First block of the journal area (always `3`) |
+| `journal_blocks` | `uint64_t` | Number of journal blocks (always `32`) |
+| `data_start` | `uint64_t` | First block available for file data |
+| `root_inode` | `uint32_t` | Inode ID of the root directory (`/`) |
+| `mount_state` | `uint32_t` | `1` = clean, `2` = dirty, `3` = needs recovery |
+| `feature_flags_compat` | `uint64_t` | Compatible feature flags |
+| `feature_flags_ro_compat` | `uint64_t` | Read-only compatible feature flags |
+| `feature_flags_incompat` | `uint64_t` | Incompatible feature flags |
+| `uuid` | `uint8_t[16]` | Volume UUID (16 bytes) |
+| `label` | `char[32]` | Human-readable volume label, null-terminated |
+| `generation` | `uint64_t` | Monotonically increasing generation counter |
+| `checksum` | `uint32_t` | CRC32 of the superblock up to (but not including) this field |
+
+---
+
+## Inode Fields
+
+Each inode is a packed `k64_xfs_inode_disk_t` structure. Up to 512 inodes are supported in the v1 format (`K64_XFS_MAX_INODES = 512`).
+
+| Field | Type | Description |
+|---|---|---|
+| `magic` | `uint32_t` | Must be `0x58494E4F` (`K64_XFS_INODE_MAGIC`) |
+| `inode_id` | `uint32_t` | Inode number (1-based) |
+| `type` | `uint16_t` | `1` = regular file, `2` = directory, `3` = symlink, `4` = device, `5` = pipe |
+| `mode` | `uint16_t` | POSIX-style permission bits (e.g. `0o100644`, `0o40755`) |
+| `uid` | `uint32_t` | Owner user ID |
+| `gid` | `uint32_t` | Owner group ID |
+| `size` | `uint64_t` | File size in bytes |
+| `link_count` | `uint32_t` | Number of hard links to this inode |
+| `flags` | `uint32_t` | Reserved inode flags |
+| `created_tick` | `uint64_t` | Creation timestamp (kernel tick) |
+| `modified_tick` | `uint64_t` | Last-modified timestamp (kernel tick) |
+| `accessed_tick` | `uint64_t` | Last-accessed timestamp (kernel tick) |
+| `generation` | `uint64_t` | Per-inode generation counter |
+| `extent_count` | `uint32_t` | Number of populated direct extents |
+| `direct_extents` | `k64_xfs_extent_disk_t[8]` | Up to 8 direct extents (logical block, physical block, count) |
+| `indirect_extent_block` | `uint64_t` | Reserved; indirect extent block pointer (not yet used) |
+| `checksum` | `uint32_t` | CRC32 of the inode up to (but not including) this field |
+
+Each direct extent (`k64_xfs_extent_disk_t`) records a `logical_block`, a `physical_block`, and a `block_count`, mapping a contiguous logical range of the file to a contiguous range of physical blocks.
+
+---
+
+## Mount Behavior
+
+The kernel mounts K64XFS through `k64_fs_driver_start()`, which runs automatically when the `fs` driver autostarts during early boot.
+
+<Steps>
+  <Step title="Reset filesystem state">
+    All cached state, mount handles, and the current working directory are cleared before probing begins.
+  </Step>
+  <Step title="Probe block devices for K64XFS">
+    Each registered block device is checked for a valid K64XFS header. The probe handles two layouts: a raw K64XFS image beginning at LBA 0 (older disk images) and an installed image beginning at LBA 2048 (behind the BIOS boot area, as used by `build/root.disk`).
+  </Step>
+  <Step title="Fall back to Multiboot module if needed">
+    If no block-backed root is found, the kernel scans the list of Multiboot modules for one whose path ends in `.xfs` — normally `root.xfs` passed from the ISO bootstrap config. This image is mapped in memory and used as the root.
+  </Step>
+  <Step title="Validate superblock, geometry, checksums, and root inode">
+    The magic bytes, version, block size, geometry fields, superblock CRC32, and root inode are all checked. Any mismatch causes the candidate image to be rejected.
+  </Step>
+  <Step title="Mount K64XFS root or report failure">
+    If a valid image was found and validated, the K64XFS mount is established and the filesystem becomes the live root. If no valid image was found by any path, the kernel logs the failure and falls back to an in-memory placeholder.
+  </Step>
+</Steps>
+
+---
+
+## Read Behavior
+
+A file read proceeds in four stages:
+
+1. **Path resolution** — the path string is split into components and each component is looked up in the parent directory's entry list, walking from the root inode.
+2. **Inode read** — the target inode is loaded from the inode table and its checksum is verified.
+3. **Extent walk** — the byte range requested is mapped to logical block numbers, and those logical blocks are located in the inode's direct extent list.
+4. **Cache read** — blocks are read through the 64-block cache; on a cache hit the data is returned directly without a block-device read.
+
+Directory files are ordinary file data composed of fixed-size `k64_xfs_dirent_disk_t` records. A directory lookup scans these records linearly until a matching name is found.
+
+---
+
+## Write and Mutation Operations
+
+K64XFS supports the following mutation operations, all of which update bitmaps, inodes, directory entries, extents, and cached data blocks in place rather than repacking the whole image:
+
+| Operation | Description |
+|---|---|
+| `mkdir` | Creates a new directory inode and adds a directory entry in the parent |
+| `mkdirp` | Creates all missing path components recursively |
+| `touch` | Creates an empty regular-file inode if the path does not exist |
+| `write` | Writes the full contents of a file, allocating new blocks as needed |
+| Range write | Writes a byte range within an existing file at a specified offset |
+| `append` | Appends bytes to an existing file |
+| `truncate` | Resizes a file, freeing blocks if the new size is smaller |
+| `rm` | Removes a file inode and its directory entry; frees allocated blocks |
+| `rmdir` | Removes an empty directory inode and its directory entry |
+| `mv` | Renames or moves a file or directory by updating directory entries |
+| `cp` | Copies a file's data and metadata into a new inode at the destination path |
+
+After any mutation, `sync` flushes all dirty cache entries to the backing block device. The mount state is set to `dirty` on the first write and returned to `clean` after a successful sync.
+
+<Warning>
+Changes made while booted in ISO-only mode (no attached disk image) are held in the in-memory Multiboot root. They are not written to any persistent device and are lost when the system reboots. Persistence requires booting with an attached `root.disk`.
+</Warning>
+
+---
+
+## 64-Block Cache
+
+The kernel-side K64XFS mount maintains a 64-entry block cache (`k64_xfs_cache_t`) embedded in the `k64_xfs_mount_t` structure. Each cache entry holds a 4096-byte block, its physical block number, a dirty flag, and a valid flag. On a write, the cache entry is marked dirty. On `sync` or unmount, all dirty entries are flushed to the block device in physical block order. The mount's `mount_state` tracks whether the volume is clean or dirty so that a crash before sync can be detected on the next mount.
+
+---
+
+## Current Boundaries
+
+<Note>
+These are the known limitations of the current K64XFS implementation. They are engineering trade-offs made during the initial design, not unrecognized defects.
+</Note>
+
+| Area | Current state |
+|---|---|
+| Block device backends | ATA PIO only; AHCI and NVMe are not yet implemented |
+| Journal | API skeleton is in place (`k64_xfs_journal_begin`, `_metadata`, `_commit`, `_recover`), but full crash recovery is not operational |
+| Extent model | Only direct extents (up to 8 per inode); indirect extent blocks are reserved but unused |
+| Directory structure | Linear scan of fixed-size dirent records; no hash trees or B-trees |
+| Checker | `xfsctl check` / `k64_xfs_check` is read-only; it reports errors but does not repair them |
+| Max inodes | 512 per volume in v1 |
+| Max name length | 128 bytes per path component (`K64_XFS_NAME_MAX`); overlong components are rejected rather than truncated |
+
+---
+
+## `k64_fs.h` Public API
+
+The `k64_fs.h` header is the stable public interface between the filesystem subsystem and the rest of the kernel. All functions take and return plain C types; no internal filesystem structures are exposed.
+
+```c
+/* Lifecycle */
+bool k64_fs_driver_start(void);
+void k64_fs_driver_stop(void);
+bool k64_fs_driver_running(void);
+
+/* Navigation */
+bool k64_fs_pwd(char* out, int out_size);
+bool k64_fs_cd(const char* path);
+
+/* Directory listing */
+bool k64_fs_ls(const char* path, char* out, int out_size);
+bool k64_fs_iter_dir(const char* path, k64_fs_iter_fn fn, void* ctx);
+
+/* Directory creation */
+bool k64_fs_mkdir(const char* path);
+bool k64_fs_mkdir_p(const char* path);
+
+/* File creation and writing */
+bool k64_fs_touch(const char* path);
+bool k64_fs_write_file(const char* path, const char* text);
+bool k64_fs_write_file_raw(const char* path, const uint8_t* data, size_t size);
+bool k64_fs_write_file_range(const char* path, size_t offset, const uint8_t* data, size_t size);
+bool k64_fs_append_file(const char* path, const char* text);
+bool k64_fs_truncate(const char* path, size_t size);
+
+/* Permissions */
+bool k64_fs_chmod(const char* path, uint32_t mode);
+bool k64_fs_chown(const char* path, uint32_t uid, uint32_t gid);
+
+/* Removal and movement */
+bool k64_fs_remove(const char* path);
+bool k64_fs_rmdir(const char* path);
+bool k64_fs_move(const char* src_path, const char* dst_path);
+bool k64_fs_copy(const char* src_path, const char* dst_path);
+
+/* Reading */
+bool k64_fs_cat(const char* path, char* out, int out_size);
+bool k64_fs_read_file_raw(const char* path, const uint8_t** data, size_t* size);
+bool k64_fs_read_file_range(const char* path, size_t offset, uint8_t* out, size_t size, size_t* read_out);
+
+/* Metadata */
+bool k64_fs_stat(const char* path, k64_fs_stat_t* out);
+
+/* Boot helpers */
+bool k64_fs_find_boot_kernel(char* out, int out_size);
+
+/* Persistence and capacity */
+bool k64_fs_sync(void);
+bool k64_fs_is_persistent(void);
+bool k64_fs_mount_source(char* out, int out_size);
+bool k64_fs_install_to_block_device(const char* device_name);
+bool k64_fs_grow_root(void);
+size_t k64_fs_used_bytes(void);
+size_t k64_fs_capacity_bytes(void);
+size_t k64_fs_image_limit_bytes(void);
+```
+
+The `k64_fs_stat_t` structure filled by `k64_fs_stat()` contains:
+
+```c
+typedef struct {
+    bool     exists;
+    bool     is_dir;
+    size_t   size;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t created_tick;
+    uint64_t modified_tick;
+    uint64_t generation;
+    char     path[256];
+} k64_fs_stat_t;
+```

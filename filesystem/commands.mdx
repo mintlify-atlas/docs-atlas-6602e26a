@@ -1,0 +1,179 @@
+---
+title: "K64XFS Filesystem Commands: fsctl, xfsctl, and Shell Ops"
+sidebarTitle: "Commands"
+description: "Complete reference for K64 filesystem shell commands: fsctl, xfsctl, and standard shell operations for directory traversal, file I/O, permissions, and sync."
+---
+
+K64 exposes its filesystem through three overlapping command surfaces: a set of shell-native file commands registered by the `fsctl` service, an `fsctl` service command group for read/write operations including permission management, and an `xfsctl` tooling surface aimed at formatting, inspecting, and exercising K64XFS volumes directly. All three surfaces operate on the same mounted K64XFS root. Changes made through any surface are reflected immediately and can be flushed to the backing block device with `sync`.
+
+---
+
+## Shell Filesystem Commands
+
+These commands are registered by the `fsctl` service and appear directly in the shell without a prefix. They form the everyday interface for navigating and modifying the root filesystem.
+
+| Command | Description | Example |
+|---|---|---|
+| `pwd` | Print the current working directory | `pwd` |
+| `ls [path]` | List directory contents; defaults to the current directory | `ls /` |
+| `cd <path>` | Change the current working directory | `cd /tmp` |
+| `mkdir <path>` | Create a directory (and all missing parents) | `mkdir /tmp/demo` |
+| `touch <path>` | Create an empty file if it does not exist | `touch /tmp/demo/note.txt` |
+| `write <path> <text>` | Write text as the complete contents of a file | `write /tmp/demo/note hello` |
+| `append <path> <text>` | Append text to an existing file | `append /tmp/demo/note -world` |
+| `cat <path>` | Print file contents to the terminal | `cat /etc/motd` |
+| `stat <path>` | Display file metadata | `stat /tmp/demo/note` |
+| `rm <path>` | Remove a file | `rm /tmp/demo/note` |
+| `rmdir <path>` | Remove an empty directory | `rmdir /tmp/demo` |
+| `mv <src> <dst>` | Rename or move a file or directory | `mv /tmp/a.txt /tmp/b.txt` |
+| `cp <src> <dst>` | Copy a file to a new path | `cp /etc/motd /tmp/motd.bak` |
+| `sync` | Flush all dirty cache entries to the backing block device | `sync` |
+
+### `stat` output fields
+
+Running `stat <path>` prints a structured block that includes:
+
+| Field | Description |
+|---|---|
+| File type | `file` or `directory` |
+| Size | File size in bytes |
+| Mode | Permission bits in octal (e.g. `0644`, `0755`) |
+| Owner UID | Numeric user ID of the file owner |
+| Group GID | Numeric group ID |
+| Generation | Per-inode generation counter |
+| Created | Creation timestamp (kernel tick) |
+| Modified | Last-modified timestamp (kernel tick) |
+
+---
+
+## `fsctl` Service Commands
+
+The `fsctl` service owns all the shell file commands listed above and additionally provides root-only administration operations for permissions and ownership. Non-root attempts to run `chmod` or `chown` are rejected.
+
+### Permission and ownership commands
+
+```bash
+chmod <mode> <path>
+chown <user>:<group> <path>
+```
+
+`chmod` updates the mode bits of the inode at `<path>`. The `<mode>` argument is an octal integer (e.g. `644`, `755`, `700`).
+
+`chown` updates the runtime owner and group of the inode. The argument format is `user:group` where both are valid account names registered in `/etc/users.k64` and `/etc/groups.k64`. Both commands require effective root (UID 0) — use `sudo` to elevate first if needed.
+
+```bash
+sudo
+chmod 600 /etc/users.k64
+chown root:root /etc/users.k64
+```
+
+### Read/write operations
+
+All the shell file commands (`mkdir`, `touch`, `write`, `append`, `cat`, `rm`, `rmdir`, `mv`, `cp`) are dispatched through `fsctl`. They go through the same permission checks as service-call-backed filesystem operations, so owner/group/other mode bits are enforced when the calling session is not root.
+
+---
+
+## `xfsctl` Commands
+
+`xfsctl` is the dedicated debugging and tooling surface for K64XFS. It operates on the live mounted volume and is also used during development to format or inspect raw disk images and Multiboot `.xfs` module files.
+
+```bash
+xfsctl <command> [args...]
+```
+
+| Command | Description |
+|---|---|
+| `xfsctl format <device> [label]` | Format a block device as K64XFS with an optional volume label |
+| `xfsctl mount <device>` | Mount a block device as the K64XFS root (useful after hot swap in development) |
+| `xfsctl info` | Print superblock fields: magic, version, block size, total/free blocks, root inode, mount state, label, UUID, generation |
+| `xfsctl list <path>` | List directory entries at `<path>` on the mounted volume |
+| `xfsctl stat <path>` | Display full inode metadata for `<path>` |
+| `xfsctl mkdir <path>` | Create a directory on the mounted volume |
+| `xfsctl write <path> <text>` | Write text as the complete file contents |
+| `xfsctl append <path> <text>` | Append text to a file |
+| `xfsctl cat <path>` | Print file contents |
+| `xfsctl remove <path>` | Remove a file |
+| `xfsctl chmod <mode> <path>` | Update mode bits (root only) |
+| `xfsctl chown <uid> <gid> <path>` | Update UID and GID (root only) |
+| `xfsctl sync` | Flush dirty cache entries to the block device |
+| `xfsctl check` | Run the read-only filesystem checker and report errors, used inode count, used block count, and free block count |
+
+### `xfsctl info` example output
+
+```text
+K64XFS volume info:
+  magic:       K64XFS1
+  version:     1.0
+  block size:  4096
+  total blocks: 8192
+  free blocks:  6104
+  root inode:  1
+  mount state: clean
+  label:       K64ROOT
+  generation:  47
+```
+
+### `xfsctl check` example output
+
+```text
+K64XFS check:
+  ok:           yes
+  errors:       0
+  used inodes:  38
+  used blocks:  2088
+  free blocks:  6104
+```
+
+<Note>
+`xfsctl check` is read-only. It reports inconsistencies and metadata errors but does not attempt to repair them. Use it to verify image integrity after a crash or before releasing a disk image.
+</Note>
+
+---
+
+## `storagectl sync` vs. bare `sync`
+
+K64 has two sync paths that are related but distinct:
+
+| Command | What it does |
+|---|---|
+| `sync` | Shell built-in shortcut; calls `k64_fs_sync()` directly to flush the K64XFS cache to the backing block device |
+| `storagectl sync` | Goes through the `storagectl` service command path; equivalent result but dispatched via the service registry rather than the shell shortcut |
+
+Both ultimately flush dirty K64XFS cache blocks to the ATA device. In normal use, bare `sync` is the faster choice. `storagectl sync` is useful from service contexts or scripts that interact with `storagectl` for other purposes.
+
+---
+
+## `grow /` — Refreshing Volume Capacity
+
+When K64 is installed to a larger disk than the original `build/root.disk` image, the in-memory superblock's `total_blocks` and `free_blocks` may not yet reflect the full partition size. Running:
+
+```bash
+grow /
+```
+
+instructs the `storagectl` service to re-read the backing partition geometry and update the mounted K64XFS volume capacity to match the actual available space. This is typically run once after installing K64 to a larger disk with `install <device> yes`.
+
+<Tip>
+After `grow /`, run `storagectl root` to verify the new capacity. The output shows used, free, and total K64XFS volume size.
+</Tip>
+
+---
+
+## Persistence Notes
+
+<CardGroup cols={2}>
+  <Card title="Persistent mode (default disk boot)" icon="hard-drive">
+    When K64 boots with `build/root.disk` attached, `k64_fs_driver_start()` mounts the K64XFS partition on the ATA device. All mutations — file writes, directory creation, permission changes — are committed to the disk on `sync` and survive reboot.
+  </Card>
+  <Card title="ISO-only mode (ephemeral)" icon="compact-disc">
+    When K64 boots from the ISO without an attached disk, the root is the in-memory Multiboot `root.xfs` module. All changes are ephemeral: they exist in RAM and are lost when the system shuts down or reboots.
+  </Card>
+</CardGroup>
+
+---
+
+## Path Validation
+
+<Warning>
+Path components longer than `K64_XFS_NAME_MAX` (128 bytes) are rejected outright — they are never silently truncated. Attempting to create, open, or stat a path with an overlong component returns an error immediately. Keep directory and file names within the 128-byte limit.
+</Warning>

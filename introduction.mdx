@@ -1,0 +1,79 @@
+---
+title: "K64: A Service-Native 64-bit Experimental Kernel"
+sidebarTitle: "Introduction"
+description: "K64 is an experimental GRUB-booted x86_64 kernel with a custom K64XFS filesystem, registry-based driver/service runtime, ring-3 ELF execution, networking, and a Linux compatibility layer."
+---
+
+K64 is a small experimental 64-bit kernel for x86_64. It boots through GRUB, switches into long mode, brings up a compact runtime, and then hands most policy to a driver and service layer built around `.k64m` and `.k64s` artifacts. This page describes what K64 is, what it is not, how its major subsystems relate to each other, and where the current boundaries are.
+
+## What K64 Is
+
+K64 is best understood as a collection of deliberate choices about where kernel responsibility ends and service/driver responsibility begins:
+
+- **BIOS/GRUB-booted x86_64 kernel.** The entry point is a Multiboot v1 payload. GRUB loads the kernel image, and the kernel transitions through 32-bit `boot.s` into 64-bit long mode before calling `k64_kernel_main()`.
+- **Legacy-hardware-oriented runtime.** The platform model uses VGA text mode, the legacy PIC and PIT, and PS/2 keyboard input. COM1 serial is probed at startup and used for output mirroring when available.
+- **Registry-based service/driver environment.** Drivers (`.k64m`) and services (`.k64s`) are tracked in fixed registries. Built-in implementations are compiled into the kernel image; rootfs-native binary modules are discovered from `/k64m` and `/k64s` after the filesystem mounts.
+- **K64XFS root filesystem.** K64XFS is the standard root filesystem in the normal build, boot, and release flow. It is used by the kernel runtime driver, by the GRUB-side `k64xfs.mod` module, by the persistent raw disk image attached as `build/root.disk`, and as an ISO fallback module (`root.xfs`).
+- **Writable ATA-backed root path.** In the default QEMU flow the ATA PIO driver registers `build/root.disk` as `ata0`, the MBR partition appears as `ata0p1`, and `fs.k64m` mounts the K64XFS partition. Writes survive reboot.
+- **First Ethernet networking path.** Built-in `rtl8139.k64m` and `e1000.k64m` drivers discover compatible PCI NICs. The `netctl` service exposes ARP, DHCP, DNS, ICMP, UDP, TCP, and a plain HTTP client (`kcurl`).
+- **User and permission model.** `userctl` manages accounts stored in `/etc/users.k64`. Runtime UID/GID identity gates file operations, ELF execution, and service calls. Privilege elevation is available via `sudo`.
+- **Cooperative asynchronous userland step.** Spawned `/ex` children can run from explicit scheduler yield/sleep points and from the shell/service poll loop before the parent calls `waitpid()`. `spawn()` returns a child PID immediately; blocking `waitpid()` can collect a specific child.
+- **Linux compatibility layer (KLCS).** A staged dynamic Linux app bridge routes selected Linux x86_64 userspace system calls into native K64 service calls. Loader/libc startup, TLS, `mmap`/`brk`, file-descriptor I/O, stat/open paths, time, and common startup stubs are wired far enough for basic staged tool execution.
+
+## What K64 Is Not
+
+<Note>
+  Several subsystems in this repository are reservation-based or partially implemented rather than fully realized. Reading the code with that distinction in mind avoids misinterpreting ambitious scaffolding as finished infrastructure.
+</Note>
+
+- **Not a fully timer-preemptive multi-process OS.** K64 has a cooperative-asynchronous userland model with a priority/aging scheduler, but it is not a full Unix-style `fork`/`exec`/process-tree runtime. Full per-user-task kernel stacks, saved user trap frames, and timer-preemptive ring-3 context switching remain future work.
+- **Not a production-ready hot-reloadable kernel.** The `reload kernel` path exists in the codebase — the request path and the trampoline/loader path are both present — but the new kernel does not successfully come back up after handoff. Treat `reload kernel` as incomplete.
+- **Not a modern UEFI/USB-first OS.** Platform assumptions are GRUB/BIOS-style Multiboot, VGA text mode, PIC/PIT, and PS/2 keyboard. This is appropriate for QEMU and older real hardware, but not yet for modern UEFI/USB/NVMe-first systems.
+- **Not a POSIX-compatible libc or socket API.** The userland libc seed covers console output, file I/O, process wrappers, and pipe creation, but there is no `fork`/`execve` ABI, dynamic linker, shared-library loader, POSIX socket API, or TLS stack.
+
+## Five Broad Areas
+
+The repository splits into five broad areas at the top level:
+
+| Area | Description |
+|---|---|
+| **Boot and low-level architecture** | `boot.s` (32-bit Multiboot entry, paging setup), `longmode.s` (64-bit entry, calls `k64_kernel_main`), `linker.ld` |
+| **Core kernel subsystems** | Terminal, logging, serial, config, IDT, PIC, PIT, PMM, VMM, scheduler, user mode, ELF loader, block layer, network stack |
+| **Runtime control planes** | Driver registry (`.k64m`), service registry (`.k64s`), shell, command dispatch, `driverctl`, `servicectl`, `storagectl`, `netctl`, `userctl`, `kpm` |
+| **Root filesystem and boot packaging** | K64XFS format, `tools/mk_k64xfs.py`, `grub/k64xfs.c`, `rootfs/` source tree, ISO and disk image build flow |
+| **Tests and host-side build tools** | Shell, filesystem, string, GRUB-config, boot smoke, persistence, ring-3 ELF, and network tests under `tests/` |
+
+## Key Architectural Idea
+
+The central design choice throughout the codebase is that **the kernel owns mechanism; services and drivers own policy and user-visible behavior.** In practical terms:
+
+- Low-level platform mechanisms belong in `k64_*.c`.
+- Hardware or low-level runtime providers are modelled as driver definitions in `k64m_def/`.
+- Commands, control planes, sessions, and long-lived system functionality are modelled as service definitions in `k64s_def/`.
+- Content that should exist inside the mounted root image lives under `rootfs/`.
+
+This is why many shell commands — `ls`, `cat`, `mkdir`, `ping`, `kpm install` — are not hard-coded into the kernel core. They are registered by running services and dispatched through the service command registry.
+
+<Note>
+  **Current hardware support:** K64 is developed and tested against QEMU with a legacy BIOS/Multiboot boot path and an RTL8139 or e1000 virtual NIC. It runs on older real hardware that supports BIOS/CSM boot, but it is not yet suited for modern UEFI-only or USB-only systems. All interactive examples in this documentation assume a QEMU environment.
+</Note>
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="layer-group" href="/architecture/overview">
+    Deep dive into boot flow, layer-by-layer kernel initialization, VMM design, and scheduler behavior.
+  </Card>
+  <Card title="Driver Model" icon="microchip" href="/runtime/driver-model">
+    How `.k64m` drivers are defined, compiled, loaded from rootfs, and managed at runtime with `driverctl`.
+  </Card>
+  <Card title="Service Model" icon="gears" href="/runtime/service-model">
+    How `.k64s` services are defined, their PID class ranges, lifecycle, command dispatch, and Ring-3 hosting policy.
+  </Card>
+  <Card title="K64XFS" icon="hard-drive" href="/filesystem/k64xfs">
+    On-disk layout, superblock format, mount behavior, write semantics, and `xfsctl` tooling.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build the ISO and boot K64 in QEMU in under ten minutes.
+  </Card>
+</CardGroup>

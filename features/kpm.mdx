@@ -1,0 +1,115 @@
+---
+title: "KPM: K64 Package Manager Client for .kpg Binary Packages"
+sidebarTitle: "KPM"
+description: "KPM is K64's package manager client. It downloads binary .kpg packages from a plain HTTP repository, validates CRC32, and installs ELF, .k64s, or .k64m payloads into the running system."
+---
+
+KPM is the K64 Package Manager client, implemented as the `kpm` service and registered as a shell command surface. It downloads binary `.kpg` packages from a plain HTTP repository server, validates header fields and a CRC32 checksum, and installs the payload into the live running system. KPM is a **client only**: K64 does not host or generate the external repository server — you point KPM at an already-running static HTTP source.
+
+## State Files
+
+KPM persists its configuration and install records in three locations:
+
+| Path | Purpose |
+|------|---------|
+| `/etc/kpm/sources.cfg` | Source base URLs (one per line) |
+| `/var/lib/kpm/installed.db` | Installed package records |
+| `/tmp/kpm/` | Download staging area |
+
+## Source Management
+
+Sources are client-side base URLs. KPM queries each source in order when searching for a package.
+
+```text
+kpm source add main http://repo.k64os.org
+kpm source add local http://192.168.178.50:8080
+kpm source list
+kpm sources
+kpm source del main
+```
+
+## Package Commands
+
+```text
+kpm list
+kpm versions hello
+kpm install hello
+kpm install hello -v 1.0.0
+```
+
+| Command | Description |
+|---------|-------------|
+| `kpm list` | List packages available across all configured sources |
+| `kpm versions <package>` | List all available versions of a package |
+| `kpm install <package>` | Download and install the latest version |
+| `kpm install <package> -v <version>` | Download and install a specific version |
+
+## Repository Layout
+
+KPM expects the HTTP server to serve the following paths relative to each source base URL:
+
+```text
+/packages.json
+/<package>/versions.json
+/<package>/<version>/package.kpg
+```
+
+`packages.json` lists available package names. `versions.json` lists available versions for each package. `k64_kpm_json_latest_version()` and `k64_kpm_json_version_exists()` parse these JSON responses to select the correct download path.
+
+## KPG v1 Binary Format
+
+Each `.kpg` file begins with a packed header followed immediately by the raw payload bytes:
+
+```c
+typedef struct kpm_package_header {
+    uint32_t magic;           /* KPG1: 0x3147504B */
+    uint16_t format_version;
+    uint16_t kind;            /* 1=ELF, 2=K64S, 3=K64M */
+    char     package_name[64];
+    char     package_version[32];
+    char     install_name[64];
+    uint64_t payload_size;
+    uint32_t payload_crc32;
+    uint32_t flags;
+    uint8_t  reserved[64];
+} __attribute__((packed)) kpm_package_header_t;
+```
+
+`magic` must equal `KPM_MAGIC` (`0x3147504B`, the bytes `KPG1`). `kind` determines where the payload is installed. `payload_crc32` is verified against the raw payload bytes before any file is written.
+
+## Package Kinds and Install Destinations
+
+| Kind | Value | Install path |
+|------|-------|-------------|
+| ELF | `1` | `/ex/<install_name>.elf` |
+| K64S | `2` | `/k64s/<install_name>.k64s` |
+| K64M | `3` | `/k64m/<install_name>.k64m` |
+
+The `install_name` field from the package header is used as the filename stem. KPM rejects install names that contain `/`, `\`, `..`, or control characters before writing anything to disk.
+
+## Installation Flow
+
+<Steps>
+  <Step title="Download to staging area">
+    KPM downloads the full package to `/tmp/kpm/<package>-<version>.kpg`. The download uses the raw HTTP path and is binary-safe: embedded zero bytes are preserved and the file is not passed through string-oriented buffers. If the full download fails, KPM falls back to range requests validated as real `206 Partial Content` replies.
+  </Step>
+  <Step title="Validate header fields">
+    `k64_kpm_validate_package_bytes()` checks the `KPG1` magic, `format_version`, `kind`, and `install_name`. Names containing `/`, `\`, `..`, or control characters are rejected immediately.
+  </Step>
+  <Step title="Verify payload CRC32">
+    The CRC32 of the payload bytes is computed and compared against `payload_crc32` in the header. A mismatch aborts the install before any destination file is touched.
+  </Step>
+  <Step title="Back up existing destination">
+    If a file already exists at the final install path, KPM saves a backup copy before overwriting it. A failed install does not leave a broken final file behind.
+  </Step>
+  <Step title="Write to final destination">
+    The validated payload is written to `/ex/`, `/k64s/`, or `/k64m/` depending on the `kind` field. The destination file is complete before the install record is updated.
+  </Step>
+  <Step title="Update install database and sync">
+    `/var/lib/kpm/installed.db` is updated with the new package record and `k64_fs_sync()` is called to flush the changes to the K64XFS backing block device.
+  </Step>
+</Steps>
+
+<Warning>
+KPM only supports `http://` source URLs. `https://` sources are **rejected** until K64 has TLS support. Attempting to add an `https://` source or install from one returns an immediate error.
+</Warning>

@@ -1,0 +1,356 @@
+---
+title: "Extending K64: Adding Drivers, Services, and Userland Programs"
+sidebarTitle: "Extending K64"
+description: "Guide to K64's four main extension points: registering built-in drivers (k64m), built-in services (k64s), adding rootfs content, and writing native C userland programs."
+---
+
+K64's development model rests on a single organizing principle: **the kernel core owns mechanism; services and drivers own most policy and user-visible behavior.** Low-level platform work — interrupt handling, memory allocation, the scheduler, the block layer — lives in `k64_*.c`. Everything above that — commands, control planes, sessions, long-lived system functionality — belongs in a `.k64s` service or a `.k64m` driver. This separation is visible throughout the codebase and is the right mental model to keep in mind before adding anything new.
+
+## Extension Points
+
+K64 has four clean paths for extending the running system without touching kernel internals.
+
+<Steps>
+
+### Adding a New Service
+
+Services are the primary unit of runtime behavior above the kernel core. They own shell-visible commands, service-call methods, session management, and anything that fits the pattern of a control plane or long-lived system component.
+
+**Where to add the source definition**
+
+- Add a text source definition at `k64s_def/<name>.svc` for a rootfs-native binary service, **or**
+- Add a built-in C implementation directly in `k64s/k64s_builtin.c`.
+
+A `.svc` source definition is compiled by `tools/build_k64x.py` into a binary `.k64s` module file that the native rootfs loader picks up from `/k64s` after mount. For example, `k64s_def/hello.svc`:
+
+```text
+name=hello
+kind=elf
+class=user
+entry=/ex/hello.elf
+```
+
+**Registering the service**
+
+Call `k64_system_register_service()` from inside your `start` callback or from `k64s_builtin.c`:
+
+```c
+k64_service_t* k64_system_register_service(
+    const char*          name,
+    const char*          source,
+    k64_service_class_t  class_id,
+    uint32_t             flags,
+    uint32_t             priority,
+    uint32_t             poll_interval_ticks,
+    bool                 controllable,
+    k64_service_start_fn start,
+    k64_service_stop_fn  stop,
+    k64_service_poll_fn  poll,
+    void*                context
+);
+```
+
+**Service lifecycle callbacks**
+
+```c
+typedef bool (*k64_service_start_fn)(struct k64_service* service);
+typedef void (*k64_service_stop_fn)(struct k64_service* service);
+typedef void (*k64_service_poll_fn)(struct k64_service* service, uint64_t now_ticks);
+```
+
+- `start` is called when the service is started; return `true` on success.
+- `stop` is called when the service is stopped or restarted.
+- `poll` is called on each scheduler tick when a `poll_interval_ticks` > 0 is set. For most services, pass `NULL`.
+
+**Choosing a service class**
+
+| Class constant | PID range | Use for |
+|---|---|---|
+| `K64_SERVICE_CLASS_USER` | 3000+ | User-facing commands, shell utilities |
+| `K64_SERVICE_CLASS_ROOT` | 2000+ | Privileged control planes |
+| `K64_SERVICE_CLASS_SYSTEM` | 1000+ | Core infrastructure and boot services |
+| `K64_SERVICE_CLASS_KERNEL` | 0 | Reserved for the kernel itself |
+
+**Registering shell-visible commands**
+
+Use `k64_system_register_command()` inside your `start` callback so the shell can dispatch those names to your handler:
+
+```c
+bool k64_system_register_command(
+    const char*           owner,
+    const char*           command,
+    k64_service_command_fn handler
+);
+```
+
+Example:
+
+```c
+k64_system_register_command("myservice", "mycommand", my_command_handler);
+```
+
+**Registering service-call methods**
+
+Service calls are the userland-accessible ABI. Ring-3 programs call them through the `service_call` syscall gate. Register them with:
+
+```c
+bool k64_system_register_call(
+    const char*         owner,
+    const char*         name,
+    uint32_t            flags,
+    k64_service_call_fn handler
+);
+```
+
+The `flags` field controls visibility and access. Key flag constants from `k64_system.h`:
+
+| Flag | Meaning |
+|---|---|
+| `K64_SERVICE_CALL_FLAG_PUBLIC` | Callable from the shell or service dispatch |
+| `K64_SERVICE_CALL_FLAG_USER_ALLOWED` | Callable from ring-3 userland |
+| `K64_SERVICE_CALL_FLAG_ROOT_ONLY` | Only callable when effective UID is root |
+| `K64_SERVICE_CALL_FLAG_KERNEL_ONLY` | Internal kernel use only |
+| `K64_SERVICE_CALL_FLAG_CAN_WRITE_FS` | Method may write to the filesystem |
+| `K64_SERVICE_CALL_FLAG_CAN_SPAWN` | Method may spawn child processes |
+| `K64_SERVICE_CALL_FLAG_CAN_NET` | Method may perform network operations |
+
+The call handler receives a `k64_service_call_request_t`:
+
+```c
+typedef struct k64_service_call_request {
+    uint64_t    caller_pid;
+    uint64_t    caller_uid;
+    uint64_t    caller_flags;
+    char        service[K64_SERVICE_CALL_OWNER_MAX];  /* 32 bytes */
+    char        method[K64_SERVICE_CALL_NAME_MAX];    /* 32 bytes */
+    const void* in;
+    size_t      in_len;
+    void*       out;
+    size_t      out_len;
+    size_t      actual_out_len;
+    uint64_t    flags;
+} k64_service_call_request_t;
+```
+
+<Tip>
+After registering all commands and calls in your `start` callback, call `k64_system_unregister_commands(owner)` and `k64_system_unregister_calls(owner)` from your `stop` callback to clean up.
+</Tip>
+
+### Adding a New Driver
+
+Drivers model hardware or low-level runtime providers — display, keyboard, block devices, network interfaces. They are registered through the module registry (`k64_modules.h`) and backed by `.k64m` binary files in `/k64m` on the rootfs.
+
+**Where to add the source definition**
+
+- Add a text source definition at `k64m_def/<name>.drv` for a rootfs-native binary driver, **or**
+- Add a built-in C implementation directly in `k64m/k64m_builtin.c`.
+
+A `.drv` source definition is compiled into a binary `.k64m` module. For example, `k64m_def/hello-driver.drv`:
+
+```text
+name=hello-driver
+kind=elf
+type=driver
+entry=/ex/hello.elf
+```
+
+Built-in `.k64m` files are metadata stubs; the native loader skips them at runtime because the implementation is already compiled into the kernel image.
+
+**Registering the driver**
+
+Call `k64_modules_register_driver()` from `k64m_builtin.c` or from a built-in init path:
+
+```c
+k64_driver_t* k64_modules_register_driver(
+    const char*         name,
+    const char*         source,
+    uint8_t             type,
+    uint32_t            flags,
+    uint32_t            priority,
+    bool                controllable,
+    k64_driver_start_fn start,
+    k64_driver_stop_fn  stop,
+    k64_driver_poll_fn  poll,
+    void*               context
+);
+```
+
+**Driver lifecycle callbacks**
+
+```c
+typedef bool (*k64_driver_start_fn)(struct k64_driver* driver);
+typedef void (*k64_driver_stop_fn)(struct k64_driver* driver);
+typedef void (*k64_driver_poll_fn)(struct k64_driver* driver, uint64_t now_ticks);
+```
+
+- `start` — initialize hardware, allocate resources; return `true` on success.
+- `stop` — tear down hardware, release resources.
+- `poll` — called on each scheduler tick for async drivers; pass `NULL` if not needed.
+
+**Driver flags**
+
+| Flag | Meaning |
+|---|---|
+| `K64_MODULE_FLAG_ASYNC` | Driver runs as a scheduled async worker task |
+| `K64_MODULE_FLAG_AUTOSTART` | Driver is started automatically during bootstrap |
+
+**Driver module types**
+
+```c
+typedef enum {
+    K64_MODULE_TYPE_DRIVER  = 1,
+    K64_MODULE_TYPE_FS      = 2,
+    K64_MODULE_TYPE_SERVICE = 3,
+} k64_module_type_t;
+```
+
+Use `K64_MODULE_TYPE_DRIVER` for hardware and device drivers. `K64_MODULE_TYPE_FS` is reserved for filesystem drivers like the built-in `fs` driver. Runtime driver management is available via `driverctl list`, `driverctl start <id>`, and `driverctl stop <id>` from the shell (root-only).
+
+### Adding Rootfs Content
+
+The host-side source tree at `rootfs/` is copied into `build/rootfs/` during the build staging step, then packed by `tools/mk_k64xfs.py` into `build/root.xfs`. Everything you place under `rootfs/` becomes part of every build's K64XFS image.
+
+Useful paths:
+
+| Path | Purpose |
+|---|---|
+| `rootfs/etc/` | System configuration files (`users.k64`, `groups.k64`, `motd`, keyboard config) |
+| `rootfs/usr/` | User home directory skeletons |
+| `rootfs/var/` | Runtime state directories |
+| `k64s_def/*.svc` | Service source definitions → compiled to `/k64s/*.k64s` |
+| `k64m_def/*.drv` | Driver source definitions → compiled to `/k64m/*.k64m` |
+
+The build system automatically:
+1. Compiles `k64s_def/*.svc` → `build/k64s/*.k64s` → staged to `/k64s/` in the rootfs image.
+2. Compiles `k64m_def/*.drv` → `build/k64m/*.k64m` → staged to `/k64m/` in the rootfs image.
+3. Stages all assembled ELFs from `ex/*.S` and compiled userland programs from `userland/bin/*.c` into `/ex/`.
+
+<Note>
+Built-in `.k64s` and `.k64m` files discovered under `/k64s` and `/k64m` at runtime are skipped by the native loaders if an implementation with the same name is already compiled into the kernel image. They exist as metadata stubs only.
+</Note>
+
+### Writing Native C Userland Programs
+
+K64 has a small but real native C userland build path. Programs compile with freestanding user-mode flags, link against the K64 crt0 and libc shim, and run in ring 3 through the `iretq` user-mode execution path.
+
+**Adding a program**
+
+1. Create `userland/bin/<name>.c`.
+2. Include the K64 userland libc header:
+
+```c
+#include <k64/libc.h>
+```
+
+The build system automatically detects new files in `userland/bin/` and:
+- Compiles with `USER_CFLAGS`:
+  ```bash
+  -Iuserland/include -m64 -ffreestanding -O2 -fno-stack-protector
+  -fno-builtin -fno-pic -fno-pie -mno-red-zone -mno-mmx -mno-sse -mno-sse2
+  ```
+- Links with `crt0.o` + `k64libc.o`, entry at `_start`, image base `0x40000000`.
+- Stages the resulting ELF to `/ex/<name>.elf` inside the rootfs image automatically.
+
+**Accessing services from userland**
+
+Ring-3 programs call kernel services through the `service_call` syscall gate. The libc shim exposes two wrappers:
+
+```c
+// Simple service call — inline input/output
+int64_t k64_service_call(const char* service, const char* method,
+                         const void* in, size_t in_len,
+                         void* out, size_t out_len);
+
+// Extended service call — also returns actual output length
+int64_t k64_service_call_ex(const char* service, const char* method,
+                            const void* in, size_t in_len,
+                            void* out, size_t out_len,
+                            size_t* actual_out_len);
+```
+
+Active service methods available to userland programs include `io.write`, `io.open`, `io.read`, `fs.stat`, `fs.list_dir`, `fs.write_file`, `fs.move`, `proc.getpid`, `proc.info`, `proc.spawn`, `proc.wait`, `proc.exit`, `sched.yield`, `sched.sleep`, `term.size`, and others registered by running services.
+
+**Running the program**
+
+After `make`, type the program name directly at the shell prompt (without the `.elf` extension):
+
+```text
+[guest]@K64 ~/ >>> myprogram
+```
+
+The shell resolves names by checking built-ins, service commands, service names, driver names, and finally `/etc/path/inpath.cfg`, which includes `/ex` as a search path. You can also run it explicitly:
+
+```text
+[guest]@K64 ~/ >>> elfrun /ex/myprogram.elf
+```
+
+</Steps>
+
+## High-Value Next Steps
+
+If you want to turn K64 into a more complete OS, the areas with the highest return on investment are:
+
+<CardGroup cols={2}>
+  <Card title="AHCI / NVMe Storage" icon="hard-drive">
+    Add AHCI and NVMe backends on top of the existing block layer. The current backend is ATA PIO only; modern storage devices need proper DMA-driven drivers.
+  </Card>
+  <Card title="USB Stack" icon="usb">
+    Add a USB controller driver and USB mass-storage class driver on top of the now multi-device block layer. Also needed for USB keyboard input on hardware without PS/2.
+  </Card>
+  <Card title="Per-Process Page Tables" icon="table">
+    Implement true per-process page tables and context isolation. The current VMM gives services and ELF runs isolated CR3 roots, but full concurrent multi-process scheduling remains future work.
+  </Card>
+  <Card title="UEFI Boot" icon="power-off">
+    Add UEFI boot support. K64 currently depends on GRUB/BIOS Multiboot, which excludes modern UEFI-only hardware paths and Secure Boot.
+  </Card>
+  <Card title="Full Disk-Based Module Loader" icon="box-open">
+    Replace the built-in registry model with a real executable loader for services and drivers from disk, rather than relying on compiled-in built-ins and Multiboot payloads.
+  </Card>
+  <Card title="USB Input" icon="keyboard">
+    Add USB HID input support. The current keyboard driver is PS/2 only via the legacy 8042 controller path.
+  </Card>
+</CardGroup>
+
+## Current Limits and Honest Boundaries
+
+Before building on K64, know where the current implementation ends.
+
+<Warning>
+These are real boundaries in the codebase as it exists today — not aspirational gaps. Design your extensions with them in mind.
+</Warning>
+
+### Virtual Memory Isolation
+
+Standalone `/ex` user programs enter ring 3, use VMM-checked syscall copy helpers for user pointers, and fault back into the kernel on invalid memory access. Services now have a mandatory Ring-3 startup gate (`K64_SERVICE_FLAG_RING3_REQUIRED`), and only the `kernel` service identity remains Ring 0. However, **a persistent Ring-3 service message loop — where every service handler runs entirely outside the kernel — remains future work**. ELF-backed drivers still execute on the kernel side as low-level hardware mechanisms.
+
+### Persistent Storage
+
+The default build uses a K64XFS image on an ATA block device. That is enough for reboot-persistent writes and direct BIOS disk boot in QEMU, but:
+
+- **MBR-only** partition support for the K64 boot disk path.
+- **No journal** and no crash recovery — the journal structure exists as a skeleton.
+- **No AHCI or NVMe backend** yet; only ATA PIO is implemented.
+
+### Hot Kernel Reload
+
+The kernel hot-reload path (`reload kernel`) does not currently complete a successful handoff into a new running kernel. The request path and trampoline exist; the new kernel does not come back up after handoff. Treat `reload kernel` as experimental and incomplete.
+
+### Legacy Hardware Only
+
+K64's platform assumptions are still legacy-oriented:
+
+- GRUB/BIOS-style Multiboot entry
+- VGA text mode output
+- PIC and PIT for interrupts and timing
+- PS/2 keyboard (8042 controller)
+- Optional COM1 serial (probed and loopback-tested; absent on modern hardware)
+
+This works well in QEMU and on older bare metal, but not on modern UEFI/USB/NVMe-first systems without CSM.
+
+### Account Security
+
+Passwords are hashed (not clear text), but the scheme is a lightweight built-in and session state is simple. **UID/GID ownership is runtime metadata rebuilt from the user database during boot — it is not yet persisted in the K64XFS on-image format.** Privilege enforcement is applied at the service-call, ELF-loader, and shell command layers, not as a deep kernel mechanism.
+
+### Services and Drivers Are Registry-Based
+
+The `.k64s` and `.k64m` formats are real binary module files, but the runtime depends heavily on compiled-in built-ins and a minimal ELF loader rather than a full isolated process or runtime model. There is no dynamic linker, no symbol resolution, and no fork/exec process tree.

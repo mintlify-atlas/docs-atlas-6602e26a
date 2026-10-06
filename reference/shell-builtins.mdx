@@ -1,0 +1,247 @@
+---
+title: "K64 Shell Built-in Commands Reference"
+sidebarTitle: "Shell Builtins"
+description: "Complete reference for K64 shell built-in commands: help, clear, ps, sched, task, ticks, serial, layout, echo, yield, reboot, shutdown, panic."
+---
+
+The K64 shell service owns a fixed set of built-in commands that are parsed and dispatched directly, before the service command registry is ever consulted. These built-ins are defined in `k64_shell_cmd.h` and handled in `k64_shell_cmd.c`. Every command that falls outside this list travels through the four-stage dispatch chain: service command registry → service start-by-name → driver start-by-name → path resolver (`/etc/path/inpath.cfg`).
+
+## Shell Prompt Format
+
+The interactive prompt always follows this pattern:
+
+```text
+[user]@K64 ~[path] >>>
+```
+
+Examples:
+
+```text
+[guest]@K64 ~/ >>>
+[root]@K64 ~/usr/root >>>
+```
+
+The `user` portion reflects the effective session identity as reported by `k64_user_effective_name()`. The `path` portion is the current working directory relative to the filesystem root.
+
+---
+
+## Built-in Commands
+
+### `help`
+
+```text
+help
+```
+
+Prints the list of recognized built-in commands and registered service commands to the terminal. Useful as a first reference for an unfamiliar system state.
+
+---
+
+### `clear`
+
+```text
+clear
+```
+
+Clears the VGA text-mode terminal screen and resets the cursor to the top-left position.
+
+---
+
+### `ticks`
+
+```text
+ticks
+```
+
+Prints the current PIT tick count — the monotonically increasing counter driven by the PIT interrupt at the configured `pit_hz` frequency. Useful for measuring elapsed time in ticks and for verifying that the timer subsystem is running.
+
+**Example output:**
+
+```text
+ticks: 14823
+```
+
+---
+
+### `task`
+
+```text
+task
+```
+
+Shows the scheduler task info for the current shell task: task ID, state, priority, remaining slice, base slice, accumulated run ticks, and wait ticks. This is the single-task view; use `sched` to see the full task table.
+
+---
+
+### `ps`
+
+```text
+ps
+```
+
+Lists all active user ELF processes tracked in the kernel user process table. Each row includes:
+
+| Column | Description |
+|---|---|
+| PID | Kernel-assigned process ID |
+| PPID | Parent process ID |
+| State | Process state (e.g. `RUNNING`, `ZOMBIE`) |
+| Exit | Exit code (meaningful for `ZOMBIE` entries) |
+| Ticks | Accumulated runtime ticks |
+| Fault | Fault vector and fault RIP (if the process faulted) |
+| Image | Filesystem path to the ELF image (e.g. `/ex/hello.elf`) |
+
+`ZOMBIE` entries remain in the table until a parent reaps them with `waitpid()`. This output is from the kernel-side process table (`k64_usermode.c`), not a service registry.
+
+---
+
+### `serial`
+
+```text
+serial
+```
+
+Reports whether COM1 serial was detected and is active. K64 probes COM1 at boot with a loopback test; if the port is absent or fails the test, serial output is disabled and K64 falls back to VGA-only console. When serial is active, the shell also accepts input from the serial line alongside PS/2 keyboard input.
+
+**Example output (serial active):**
+
+```text
+serial: COM1 active
+```
+
+**Example output (serial absent):**
+
+```text
+serial: not detected
+```
+
+---
+
+### `sched`
+
+```text
+sched
+```
+
+Prints the full scheduler task table. Each row describes one tracked task:
+
+| Column | Description |
+|---|---|
+| State | Task state (`READY`, `RUNNING`, `SLEEPING`, `BLOCKED`) |
+| `*` | Marks the currently executing task |
+| Priority | Numeric priority (lower number = higher priority) |
+| Remaining | Remaining ticks in the current time slice |
+| Base | Base slice size assigned to this task |
+| Run ticks | Total ticks the task has been running |
+| Wait ticks | Total ticks the task has spent waiting |
+
+The scheduler favors higher-priority work without permanently starving lower-priority tasks by tracking accumulated wait ticks.
+
+---
+
+### `echo`
+
+```text
+echo <text>
+```
+
+Prints the supplied text to the terminal, followed by a newline.
+
+**Example:**
+
+```text
+echo hello from K64
+```
+
+**Output:**
+
+```text
+hello from K64
+```
+
+---
+
+### `layout`
+
+```text
+layout <us|de>
+```
+
+Switches the active PS/2 keyboard layout. Valid arguments are `us` (US QWERTY) and `de` (German QWERTZ). When a layout is switched, the shell writes the new value to `/etc/keyboard/layout.cfg` and calls `k64_fs_sync()` to persist the change when a writable root filesystem is mounted.
+
+The active layout is loaded from `/etc/keyboard/layout.cfg` at shell startup. The German layout includes AltGr combinations: `AltGr+Q` → `@`, `AltGr+E` → `€`, and standard bracket, brace, backslash, pipe, and tilde positions.
+
+**Example:**
+
+```text
+layout de
+```
+
+---
+
+### `yield`
+
+```text
+yield
+```
+
+Yields the current shell task back to the scheduler. The scheduler will run other ready tasks before returning to the shell. Primarily useful for testing cooperative scheduling behavior and ensuring queued child processes advance before a blocking wait.
+
+---
+
+### `panic`
+
+```text
+panic
+```
+
+Triggers a deliberate kernel panic. Intended for debugging and testing the panic output path. The kernel prints a panic banner to both VGA and serial (if active) and halts.
+
+<Warning>
+`panic` halts the system immediately. All unsaved state is lost. Use only in development or test environments.
+</Warning>
+
+---
+
+### `reboot`
+
+```text
+reboot
+```
+
+Performs a machine-level reboot via the power control subsystem (`k64_power.c`). In QEMU this terminates and restarts the VM. On compatible legacy hardware it triggers a hardware reset.
+
+---
+
+### `shutdown`
+
+```text
+shutdown
+```
+
+Performs a machine-level power-off. In QEMU this exits the VM. On ACPI-capable or APM legacy hardware it powers down the machine.
+
+---
+
+## Dispatch Order
+
+When you type a command, the shell processes it in this exact sequence:
+
+<Steps>
+  <Step title="Built-in check">
+    The shell parses the command name against its own built-in list (`k64_shell_parse_command()`). If it matches, the built-in handler runs immediately and no further lookup happens.
+  </Step>
+  <Step title="Service command registry">
+    The shell calls `k64_system_dispatch_command()`. If a running service has registered that command name via `k64_system_register_command()`, its handler runs.
+  </Step>
+  <Step title="Service or driver start-by-name">
+    If still unresolved, the shell tries to start a service or driver whose name matches the command string. This is how typing `hello` can start `/k64s/hello.k64s` or `/k64m/hello-driver.k64m` if such a module exists on the rootfs.
+  </Step>
+  <Step title="Path resolver">
+    Finally, the shell consults `/etc/path/inpath.cfg`. The default entries are `/ex`, `/compat/linux/bin`, and `/compat/linux/usr/bin`. A bare name like `nano` or `hello` will resolve to the first matching ELF in those directories.
+  </Step>
+</Steps>
+
+<Note>
+All commands in this page are handled at step 1 and never reach the service registry. Commands such as `servicectl`, `ls`, `cat`, and `kpm` are registered by services and are handled at step 2.
+</Note>

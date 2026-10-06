@@ -1,0 +1,239 @@
+---
+title: "K64 Artifact Formats: .k64m Driver and .k64s Service Binaries"
+sidebarTitle: "Artifact Formats"
+description: "Reference for the .k64m driver and .k64s service binary artifact formats, their packed header structures, execution kinds, flags, and the source definition (.drv/.svc) compile flow."
+---
+
+`.k64m` and `.k64s` are the native binary module formats used by K64 for drivers and services respectively. They are the primary extensibility mechanism above the kernel core: the kernel discovers and loads these files from `/k64m/` and `/k64s/` in the mounted K64XFS root filesystem after startup, registering their metadata into the driver and service registries. Both formats are packed binary files generated at build time from human-readable source definitions in `k64m_def/*.drv` and `k64s_def/*.svc`. A third format, `.kpg`, is used by the KPM package manager to distribute and install `.k64m`, `.k64s`, and ELF payloads over HTTP.
+
+---
+
+## `.k64m` — Driver Module Format
+
+`.k64m` files represent K64 drivers. The magic constant `K64_MODULE_MAGIC` identifies a valid module header.
+
+### Legacy External Module Header (`k64_module_header_t`)
+
+The legacy format is used when a `.k64m` file is passed in as a Multiboot module. It is still recognized for compatibility but is no longer the primary loading path.
+
+```c
+// k64_modules.h
+#define K64_MODULE_MAGIC 0x4B36344D  /* "K64M" */
+
+typedef struct k64_module_header {
+    uint32_t magic;        /* Must equal K64_MODULE_MAGIC                */
+    uint8_t  version;      /* Header version                             */
+    uint8_t  type;         /* k64_module_type_t value                    */
+    uint16_t flags;        /* K64_MODULE_FLAG_* bitmask                  */
+    uint64_t entry_offset; /* Entry point = module_base + entry_offset   */
+    char     name[32];     /* Null-terminated module name                */
+} __attribute__((packed)) k64_module_header_t;
+```
+
+### Module Type Enum
+
+```c
+typedef enum {
+    K64_MODULE_TYPE_DRIVER  = 1,
+    K64_MODULE_TYPE_FS      = 2,
+    K64_MODULE_TYPE_SERVICE = 3,
+} k64_module_type_t;
+```
+
+### Module Flags
+
+| Flag | Value | Description |
+|---|---|---|
+| `K64_MODULE_FLAG_ASYNC` | `1 << 0` | Driver runs as an async scheduled worker task |
+| `K64_MODULE_FLAG_AUTOSTART` | `1 << 1` | Driver is started automatically during bootstrap |
+
+### Native Rootfs `.k64m` Binary Format
+
+The native rootfs loader (post-filesystem mount) reads a packed binary struct from each `.k64m` file in `/k64m/`. This is defined in `k64_artifact.h`:
+
+```c
+// k64_artifact.h
+#define K64_ARTIFACT_VERSION     1
+#define K64_ARTIFACT_EXEC_BUILTIN 1
+#define K64_ARTIFACT_EXEC_ELF    2
+
+typedef struct k64_driver_file {
+    uint32_t magic;          /* K64_MODULE_MAGIC = 0x4B36344D ("K64M") */
+    uint8_t  version;        /* K64_ARTIFACT_VERSION                   */
+    uint8_t  exec_kind;      /* BUILTIN=1 or ELF=2                     */
+    uint8_t  type;           /* k64_module_type_t                      */
+    uint8_t  reserved0;
+    uint32_t flags;          /* K64_MODULE_FLAG_* bitmask              */
+    uint32_t priority;       /* Scheduler priority                     */
+    uint32_t reserved1;
+    char     name[32];       /* Driver name, e.g. "ata"                */
+    char     entry_path[96]; /* ELF path when exec_kind=ELF            */
+} __attribute__((packed)) k64_driver_file_t;
+```
+
+### Source Definition Format (`.drv`)
+
+Driver source definitions live in `k64m_def/*.drv`. They use a simple key=value text format:
+
+```text
+name=fs
+kind=builtin
+type=filesystem
+autostart=1
+```
+
+```text
+name=ata
+kind=builtin
+type=driver
+```
+
+These are compiled into binary `.k64m` files by the build tool:
+
+```bash
+python3 tools/build_k64x.py driver <src.drv> <dst.k64m>
+```
+
+**Output location:** `build/k64m/*.k64m` → staged to rootfs `/k64m/`
+
+<Tip>
+Use `driverctl list` at runtime to see all registered drivers, their IDs, state, names, and source binary paths. Drivers loaded from `/k64m/` appear with their rootfs path in the source column.
+</Tip>
+
+---
+
+## `.k64s` — Service Module Format
+
+`.k64s` files represent K64 services. The magic constant `K64_SYSTEM_MAGIC` identifies a valid service header.
+
+### Legacy External Service Header (`k64_system_header_t`)
+
+The legacy format is used when a `.k64s` file is passed in as a Multiboot module. Recognized for compatibility but not the primary model.
+
+```c
+// k64_system.h
+#define K64_SYSTEM_MAGIC 0x4B363453  /* "K64S" */
+
+typedef struct k64_system_header {
+    uint32_t magic;        /* Must equal K64_SYSTEM_MAGIC               */
+    uint8_t  version;      /* Header version                            */
+    uint8_t  priority;     /* Scheduler priority                        */
+    uint16_t flags;        /* K64_SYSTEM_FLAG_* bitmask                 */
+    uint64_t entry_offset; /* Entry point = module_base + entry_offset  */
+    char     name[32];     /* Null-terminated service name              */
+} __attribute__((packed)) k64_system_header_t;
+```
+
+### Service Class Enum
+
+```c
+typedef enum {
+    K64_SERVICE_CLASS_KERNEL = 0,
+    K64_SERVICE_CLASS_SYSTEM = 1,
+    K64_SERVICE_CLASS_ROOT   = 2,
+    K64_SERVICE_CLASS_USER   = 3,
+} k64_service_class_t;
+```
+
+Service classes map to PID ranges: kernel=0, system=1000+, root=2000+, user=3000+.
+
+### Service Flags
+
+| Flag | Value | Description |
+|---|---|---|
+| `K64_SERVICE_FLAG_ASYNC` | `1 << 0` | Service runs as an async scheduled worker task |
+| `K64_SERVICE_FLAG_AUTOSTART` | `1 << 1` | Service is started automatically during bootstrap |
+| `K64_SERVICE_FLAG_ESSENTIAL` | `1 << 2` | Service cannot be stopped; stop attempts are rejected |
+| `K64_SERVICE_FLAG_RING3_REQUIRED` | `1 << 3` | Service must pass Ring-3 verification before its commands or calls can dispatch |
+
+### Native Rootfs `.k64s` Binary Format
+
+The native rootfs service loader reads a packed binary struct from each `.k64s` file in `/k64s/`. This is defined in `k64_artifact.h`:
+
+```c
+// k64_artifact.h
+typedef struct k64_service_file {
+    uint32_t magic;                 /* K64_SYSTEM_MAGIC = 0x4B363453 ("K64S") */
+    uint8_t  version;               /* K64_ARTIFACT_VERSION                   */
+    uint8_t  exec_kind;             /* BUILTIN=1 or ELF=2                     */
+    uint8_t  class_id;              /* k64_service_class_t                    */
+    uint8_t  reserved0;
+    uint32_t flags;                 /* K64_SERVICE_FLAG_* bitmask             */
+    uint32_t priority;              /* Scheduler priority                     */
+    uint32_t poll_interval_ticks;   /* Async poll interval in PIT ticks       */
+    char     name[32];              /* Service name, e.g. "shell"             */
+    char     entry_path[96];        /* ELF path when exec_kind=ELF            */
+} __attribute__((packed)) k64_service_file_t;
+```
+
+### Source Definition Format (`.svc`)
+
+Service source definitions live in `k64s_def/*.svc`. They use the same key=value text format as `.drv` files:
+
+```text
+name=shell
+kind=builtin
+class=system
+async=1
+```
+
+```text
+name=init
+kind=builtin
+class=system
+```
+
+These are compiled into binary `.k64s` files by the build tool:
+
+```bash
+python3 tools/build_k64x.py service <src.svc> <dst.k64s>
+```
+
+**Output location:** `build/k64s/*.k64s` → staged to rootfs `/k64s/`
+
+<Tip>
+Use `servicectl list` at runtime to see all registered services, their PIDs, class, state, and VM base addresses.
+</Tip>
+
+---
+
+## Execution Kinds
+
+Both `.k64m` and `.k64s` files carry an `exec_kind` field that determines how the module's implementation is resolved at load time:
+
+| Kind | Value | Description |
+|---|---|---|
+| `builtin` | `K64_ARTIFACT_EXEC_BUILTIN = 1` | The module is a metadata stub only. The real implementation is compiled directly into the kernel image. The rootfs loader sees the stub, confirms the name matches a registered built-in, and skips re-loading it. |
+| `elf` | `K64_ARTIFACT_EXEC_ELF = 2` | The module carries an `entry_path` (e.g. `/ex/hello.elf`). When the driver or service is started, the ELF loader resolves the path through K64XFS and maps the program into an isolated VM space. |
+
+All built-in services and drivers shipped with K64 (such as `shell`, `init`, `fsctl`, `driverctl`, `screen`, `keyboard`) use `kind=builtin` in their `.svc` / `.drv` source files. The `hello.k64s` and `hello-driver.k64m` examples in the repository use `kind=elf` with `entry_path=/ex/hello.elf`.
+
+---
+
+## `.kpg` — KPM Package Format
+
+The `.kpg` format is used by the K64 Package Manager (`kpm`) to distribute drivers, services, and ELF programs over HTTP from a static package repository. A `.kpg` file consists of a packed header followed immediately by the raw payload bytes.
+
+### Header Fields
+
+| Field | Description |
+|---|---|
+| Magic | `KPG1` (4 bytes) — identifies a valid KPM package |
+| Package name | Human-readable package identifier |
+| Version | Semantic version string |
+| Install name | The final filename used when installing the payload (without directory or extension) |
+| Payload size | Size of the payload in bytes |
+| Kind | Payload type: `ELF`, `K64S`, or `K64M` |
+| CRC32 | Checksum of the payload bytes; validated before installation |
+
+KPM validates the header and CRC32 before writing any files. Install names that contain `/`, `\`, `..`, or control characters are rejected outright — the install name is used to construct the final destination path (`/ex/<name>.elf`, `/k64s/<name>.k64s`, or `/k64m/<name>.k64m`), so unsafe names could escape the intended directory.
+
+### Install Destinations by Kind
+
+| Kind | Installed to |
+|---|---|
+| `ELF` | `/ex/<install_name>.elf` |
+| `K64S` | `/k64s/<install_name>.k64s` |
+| `K64M` | `/k64m/<install_name>.k64m` |
+
+KPM downloads to `/tmp/kpm/<package>-<version>.kpg` first, validates, then writes the final destination. If an existing file is being replaced, it is backed up before overwrite so a failed install does not leave a broken final file. A successful install updates `/var/lib/kpm/installed.db` and calls `k64_fs_sync()`.

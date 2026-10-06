@@ -1,0 +1,339 @@
+---
+title: "K64 Service Model: .k64s Artifacts and Service-Call ABI"
+sidebarTitle: "Service Model"
+description: "K64 services are .k64s binary artifacts with PID-class namespacing, command dispatch, lifecycle callbacks, and a typed service-call ABI for userland and kernel consumers."
+---
+
+Services are the primary unit of runtime behavior above the kernel core in K64. Everything from filesystem commands and network control to the interactive shell is a named service registered in a fixed table of up to 32 entries. Services are packaged as `.k64s` binary artifacts and can be built-in (compiled into the kernel image), loaded from `/k64s` on the mounted K64XFS root, or delivered as Multiboot modules on the legacy path. On top of lifecycle callbacks, services can register shell-visible commands and typed service-call methods reachable from both other services and userland programs via the `service_call` syscall.
+
+## Service Registry
+
+The registry holds up to **32 entries**. K64 uses semantic PID ranges to namespace services by their role:
+
+| PID Range | Class | Description |
+|---|---|---|
+| `0` | `kernel` | The kernel itself; only one entry, always Ring 0 |
+| `1000+` | `system` | Core system services started by `init` |
+| `2000+` | `root` | Root-privileged services |
+| `3000+` | `user` | User-level services |
+
+The four service classes are enumerated as `k64_service_class_t`:
+
+```c
+typedef enum {
+    K64_SERVICE_CLASS_KERNEL = 0,
+    K64_SERVICE_CLASS_SYSTEM = 1,
+    K64_SERVICE_CLASS_ROOT   = 2,
+    K64_SERVICE_CLASS_USER   = 3,
+} k64_service_class_t;
+```
+
+## `k64_service_t` Fields
+
+Each registry entry is a `k64_service_t` struct (defined in `k64_system.h`):
+
+```c
+typedef struct k64_service {
+    uint64_t             pid;
+    char                 name[32];
+    char                 source[48];
+    k64_service_class_t  class_id;
+    k64_service_state_t  state;
+    uint32_t             flags;
+    uint32_t             priority;
+    uint32_t             poll_interval_ticks;
+    uint64_t             start_count;
+    uint64_t             stop_count;
+    uint64_t             last_start_tick;
+    uint64_t             last_poll_tick;
+    uint64_t             managed_pid;
+    uint64_t             user_pid;
+    bool                 controllable;
+    bool                 ring3_required;
+    bool                 ring3_verified;
+    char                 entry_path[96];
+    k64_service_start_fn start;
+    k64_service_stop_fn  stop;
+    k64_service_poll_fn  poll;
+    k64_vm_space_t       vm_space;
+    k64_task_t*          task;
+    void*                context;
+} k64_service_t;
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `pid` | `uint64_t` | Semantic PID (e.g. 1000, 1001, …) |
+| `name` | `char[32]` | Service name, e.g. `shell`, `fsctl` |
+| `source` | `char[48]` | Source artifact path string |
+| `class_id` | `k64_service_class_t` | kernel / system / root / user |
+| `state` | `k64_service_state_t` | `STOPPED` or `RUNNING` |
+| `flags` | `uint32_t` | Bitmask of `K64_SERVICE_FLAG_*` values |
+| `priority` | `uint32_t` | Scheduler priority |
+| `poll_interval_ticks` | `uint32_t` | How often `poll` is called, in PIT ticks |
+| `start_count` | `uint64_t` | Total starts |
+| `stop_count` | `uint64_t` | Total stops |
+| `last_start_tick` | `uint64_t` | PIT tick at last start |
+| `last_poll_tick` | `uint64_t` | PIT tick at last poll |
+| `managed_pid` | `uint64_t` | PID exposed by `servicectl list` |
+| `user_pid` | `uint64_t` | Associated user-process PID if running a Ring-3 ELF |
+| `controllable` | `bool` | Whether `servicectl start/stop/restart` is permitted |
+| `ring3_required` | `bool` | Service must pass Ring-3 verification before its commands/calls can dispatch |
+| `ring3_verified` | `bool` | Has passed Ring-3 verification |
+| `entry_path` | `char[96]` | Optional ELF entry path, e.g. `/ex/hello.elf` |
+| `start` | `k64_service_start_fn` | Called to start the service |
+| `stop` | `k64_service_stop_fn` | Called to stop the service |
+| `poll` | `k64_service_poll_fn` | Called periodically for async services |
+| `vm_space` | `k64_vm_space_t` | Private virtual memory space reservation |
+| `task` | `k64_task_t*` | Scheduler task for async services |
+| `context` | `void*` | Service-private data pointer |
+
+## Service Flags
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `K64_SERVICE_FLAG_ASYNC` | `1 << 0` | Service is launched as an async scheduler task |
+| `K64_SERVICE_FLAG_AUTOSTART` | `1 << 1` | Service is started automatically during bootstrap |
+| `K64_SERVICE_FLAG_ESSENTIAL` | `1 << 2` | Service cannot be stopped via `servicectl stop` |
+| `K64_SERVICE_FLAG_RING3_REQUIRED` | `1 << 3` | Service must verify its Ring-3 ELF image before commands/calls are permitted |
+
+## Service Lifecycle Functions
+
+The key lifecycle functions exposed by `k64_system.h` are:
+
+| Function | Description |
+|---|---|
+| `k64_system_registry_init()` | Zeroes the service table and initialises the registry state |
+| `k64_system_register_core_services()` | Registers the built-in `kernel` service at PID 0 |
+| `k64_system_init()` | Registers all built-in services defined in `k64s/k64s_builtin.c` |
+| `k64_system_bootstrap()` | Autostarts services with `K64_SERVICE_FLAG_AUTOSTART`, then finds and one-shot runs `init` |
+| `k64_system_poll_async()` | Compatibility stub; async services are now scheduled as worker tasks |
+
+### Bootstrap Behaviour
+
+<Steps>
+  <Step title="Autostart">
+    `k64_system_bootstrap()` iterates the registry and calls `start` on every service whose flags include `K64_SERVICE_FLAG_AUTOSTART`.
+  </Step>
+  <Step title="Find init">
+    The bootstrap function looks up the service named `init` by name.
+  </Step>
+  <Step title="Run init">
+    If `init` exists, it is started. `init` in turn starts `servicectl`, `driverctl`, `storagectl`, `netctl`, `kpm`, `fsctl`, `xfsctl`, `userctl`, `sysfetch`, `uname`, `klcs`, `k64cc`, `elfctl`, `reload`, `shell`, and related services.
+  </Step>
+  <Step title="Stop init">
+    Immediately after `init`'s start callback returns, the kernel stops it. `init` is treated as a **one-shot bootstrap root**, not a long-lived PID 1 loop.
+  </Step>
+</Steps>
+
+<Note>
+If no `init` service is found in the registry, K64 logs a warning and enters the idle dispatcher loop without a shell or any user-facing surface.
+</Note>
+
+## Built-in Services
+
+All of the following are registered by `k64s_builtin.c` and started by `init`:
+
+| Name | Description |
+|---|---|
+| `init` | Starts the rest of the base service layer; one-shot bootstrap root |
+| `servicectl` | Service management command surface (`servicectl list`, `start`, `stop`, `restart`) |
+| `driverctl` | Driver management command surface (`driverctl list`, `start`, `stop`, `restart`) |
+| `storagectl` | Block-device inspection, partition management, and filesystem sync |
+| `netctl` | Network inspection, DHCP, ARP, DNS, ping, UDP, and HTTP (`kcurl`) commands |
+| `kpm` | K64 Package Manager: source management, package listing, version query, and install |
+| `reload` | Runtime reload request surface (`reload drivers`, `reload kernel`) |
+| `fsctl` | Read/write filesystem command surface (ls, cat, write, mkdir, stat, chmod, …) |
+| `userctl` | User/session/privilege management (login, sudo, useradd, groups, …) |
+| `sysfetch` | System information display (ASCII art + kernel, memory, and filesystem stats) |
+| `uname` | Kernel identity output (`K64 k64-kernel-v<version> x86_64`) |
+| `k64cc` | In-system builder for stub ELF, `.k64s`, and `.k64m` scaffolds |
+| `elfctl` | Explicit ELF execution via `elfrun </path/to/file.elf>` |
+| `shell` | Interactive command-line service backed by PS/2 and serial input |
+
+## Two Loading Paths
+
+### Legacy External Format (Multiboot)
+
+External services can be delivered as Multiboot modules. The kernel recognises them by a packed header:
+
+```c
+typedef struct {
+    uint32_t magic;        /* K64_SYSTEM_MAGIC (0x4B363453, "K64S") */
+    uint8_t  version;
+    uint8_t  priority;
+    uint16_t flags;
+    uint64_t entry_offset;
+    char     name[32];
+} __attribute__((packed)) k64_system_header_t;
+```
+
+<Note>
+The legacy Multiboot path is still present for compatibility but is no longer the preferred extensibility model. Native rootfs `.k64s` files are the standard on-disk format.
+</Note>
+
+### Native Rootfs Format (`/k64s`)
+
+After the filesystem driver has mounted K64XFS and after built-in services have registered, the native loader scans `/k64s`. Each `.k64s` file is a packed binary artifact encoding:
+
+| Field | Description |
+|---|---|
+| `K64S` magic | 4-byte identifier (`0x4B363453`) |
+| Artifact version | Format revision byte |
+| Execution kind | `builtin` (stub; skip) or `elf` (load via ELF loader) |
+| Service class | kernel / system / root / user |
+| Flags | `autostart`, `async`, `essential`, `ring3_required` |
+| Priority | Scheduler priority |
+| Poll interval | Ticks between `poll` calls |
+| Name | Service name string |
+| Entry path | Optional ELF path, e.g. `/ex/hello.elf` |
+
+These files are compiled from source definitions in `k64s_def/*.svc`. For example, `k64s_def/hello.svc`:
+
+```text
+name=hello
+kind=elf
+class=user
+entry=/ex/hello.elf
+```
+
+This produces `/k64s/hello.k64s` in the staged rootfs. When the native loader encounters it, it registers a new user-class service named `hello` whose `start` callback resolves `/ex/hello.elf` through the ELF loader.
+
+<Info>
+Built-in `.k64s` files are metadata stubs skipped by the rootfs loader because their implementation is already compiled into the kernel image. Only `kind=elf` entries cause new service registrations.
+</Info>
+
+## Service Command Registration
+
+Services expose shell-visible commands by registering handlers with the service command registry:
+
+```c
+bool k64_system_register_command(
+    const char*            owner,    /* service name that owns this command */
+    const char*            command,  /* command string the shell will match */
+    k64_service_command_fn handler   /* bool handler(const char* command, const char* args) */
+);
+```
+
+When the shell receives a command it does not own directly, it calls:
+
+```c
+bool k64_system_dispatch_command(const char* command, const char* args);
+```
+
+This iterates all registered commands and invokes the handler for the first matching entry. The `fsctl` service, for instance, registers `pwd`, `ls`, `cd`, `mkdir`, `cat`, `write`, `stat`, `rm`, `mv`, `cp`, `sync`, and others through this mechanism.
+
+### Shell Command Dispatch Chain
+
+<Steps>
+  <Step title="Shell built-ins">
+    The shell checks whether the command matches one of the commands it owns directly (e.g. `help`, `clear`, `ticks`, `ps`, `layout`).
+  </Step>
+  <Step title="Service command registry">
+    The shell calls `k64_system_dispatch_command()`. If any running service has registered a handler for this command name, that handler is invoked.
+  </Step>
+  <Step title="Start service or driver by name">
+    If still unresolved, the shell tries `k64_system_start_service_by_name(command)` and then `k64_modules_start_driver_by_name(command)`. Typing `hello` at the shell can therefore start `/k64s/hello.k64s` or `/k64m/hello-driver.k64m`.
+  </Step>
+  <Step title="Path search via /etc/path/inpath.cfg">
+    As a last resort, the shell searches the directories listed in `/etc/path/inpath.cfg`. The default entries are `/ex`, `/compat/linux/bin`, and `/compat/linux/usr/bin`. This lets K64-native ELFs in `/ex` and staged Linux ELFs in `/compat/linux` run by bare name.
+  </Step>
+</Steps>
+
+<Tip>
+The four-stage chain is what makes `servicectl` work both as a typed service name (`servicectl start 1000`) and as a registered command surface — and why KLCS Linux binaries such as `nano` and `tcc` run by bare name after installation.
+</Tip>
+
+## Service-Call ABI
+
+Beyond shell commands, services can register named typed methods callable from both other services and Ring-3 userland programs via the `service_call` syscall (vector `0x80`, number `25`).
+
+### Registering a Call
+
+```c
+bool k64_system_register_call(
+    const char*         owner,   /* service name */
+    const char*         name,    /* method name, e.g. "status" */
+    uint32_t            flags,   /* K64_SERVICE_CALL_FLAG_* bitmask */
+    k64_service_call_fn handler  /* int64_t handler(const k64_service_call_request_t* req) */
+);
+```
+
+### Dispatching a Call
+
+```c
+int64_t k64_system_dispatch_call(
+    const char* service,
+    const char* method,
+    const void* in,
+    size_t      in_len,
+    void*       out,
+    size_t      out_len,
+    size_t*     actual_out_len,
+    uint64_t    caller_pid,
+    uint64_t    caller_flags
+);
+```
+
+### `k64_service_call_request_t`
+
+Handlers receive a pointer to a `k64_service_call_request_t`:
+
+```c
+typedef struct k64_service_call_request {
+    uint64_t    caller_pid;
+    uint64_t    caller_uid;
+    uint64_t    caller_flags;
+    char        service[K64_SERVICE_CALL_OWNER_MAX];   /* 32 bytes */
+    char        method[K64_SERVICE_CALL_NAME_MAX];     /* 32 bytes */
+    const void* in;
+    size_t      in_len;
+    void*       out;
+    size_t      out_len;
+    size_t      actual_out_len;
+    uint64_t    flags;
+} k64_service_call_request_t;
+```
+
+### Service-Call Flags
+
+| Flag | Value | Description |
+|---|---|---|
+| `K64_SERVICE_CALL_FLAG_PUBLIC` | `1 << 0` | Callable by any context |
+| `K64_SERVICE_CALL_FLAG_KERNEL_ONLY` | `1 << 1` | Only kernel-internal callers may invoke this method |
+| `K64_SERVICE_CALL_FLAG_ROOT_ONLY` | `1 << 2` | Caller must have effective root |
+| `K64_SERVICE_CALL_FLAG_USER_ALLOWED` | `1 << 3` | Callable from Ring-3 user programs via `service_call` syscall |
+| `K64_SERVICE_CALL_FLAG_CAN_SPAWN` | `1 << 4` | Handler is permitted to spawn child processes |
+| `K64_SERVICE_CALL_FLAG_CAN_WRITE_FS` | `1 << 5` | Handler is permitted to write to the filesystem |
+| `K64_SERVICE_CALL_FLAG_CAN_NET` | `1 << 6` | Handler is permitted to send or receive network packets |
+
+<Warning>
+Service-call strings and byte buffers are always copied through VMM-checked user-memory helpers. Kernel code never dereferences a raw user pointer directly. Malformed or unmapped user pointers return a stable `K64_ERR_*` error code rather than faulting into kernel state.
+</Warning>
+
+## `servicectl` Commands
+
+| Command | Description |
+|---|---|
+| `servicectl list` | List all registered services: PID, state, class, Ring host, name, VM base |
+| `servicectl list stopped` | List only services in `STOPPED` state |
+| `servicectl stopped` | Alias for `servicectl list stopped` |
+| `servicectl start <pid>` | Start the service with the given PID |
+| `servicectl stop <pid>` | Stop the service with the given PID |
+| `servicectl restart <pid>` | Stop then immediately restart the service |
+
+<Note>
+Root can manage all services. Non-root users can only manage user-class services. `K64_SERVICE_FLAG_ESSENTIAL` services cannot be stopped by anyone via `servicectl`.
+</Note>
+
+The `servicectl list` output columns are:
+
+```text
+PID   STATE    CLASS   HOST     NAME              VM BASE
+0     running  kernel  ring0    kernel            0x0000000000000000
+1000  running  system  ring3    servicectl        0x0000000041000000
+1001  running  system  ring3    driverctl         0x0000000042000000
+...
+```
+
+The `HOST` column shows `ring0` for the kernel service, `ring3` for a service that has passed Ring-3 verification, and `blocked` if a Ring-3-required service has not yet been verified.

@@ -1,0 +1,144 @@
+---
+title: "K64 ELF64 Loader: Ring-3 User Process Execution"
+sidebarTitle: "ELF Loader"
+description: "K64's minimal ELF64 loader supports ET_EXEC and ET_DYN x86_64 images, maps PT_LOAD segments into isolated VM spaces, and launches /ex/*.elf programs in ring 3."
+---
+
+K64 includes a real minimal ELF64 loader for filesystem-backed executables. Programs stored in `/ex` on K64XFS are loaded into isolated virtual memory spaces and entered in ring 3 through an `iretq`-based user-mode transition. ELF-backed service and driver modules use a separate kernel-side call path through the same loader infrastructure. The result is a split execution model: user-facing programs run with true ring-3 privilege separation, while kernel-managed modules remain behind the kernel boundary.
+
+## What the Loader Supports Today
+
+The loader handles the following ELF variants and features:
+
+- **Format**: ELF64, little-endian
+- **Types**: `ET_EXEC` (static executables) and `ET_DYN` (position-independent executables)
+- **Architecture**: x86_64 machine type only
+- **Program headers**: `PT_LOAD` segments, mapped into a private executable address space at the ELF virtual address
+- **BSS tails**: zero-filled in the mapped region
+- **Entry paths**: either through an isolated kernel `CR3` (ring-0 ELF-backed modules) or through the ring-3 user-mode path (for `/ex/*.elf` and `elfrun`)
+
+## Execution Flow
+
+<Steps>
+  <Step title="Read file bytes from K64XFS">
+    `k64_fs_read_file_raw()` exposes the raw bytes of the ELF file from the mounted K64XFS root filesystem. No in-memory caching is assumed — the loader works directly from the raw file buffer.
+  </Step>
+
+  <Step title="Validate ELF header and program-header table">
+    `k64_elf_execute_path()` checks the ELF magic, class (64-bit), data encoding (little-endian), machine type (x86_64), and then walks the program-header table. Program headers whose file ranges, memory ranges, or alignments overflow or contradict the file size are rejected before any mapping begins.
+  </Step>
+
+  <Step title="Allocate a temporary isolated VM space">
+    The loader asks the VMM for a fresh isolated address space — a private page-table root (CR3) that clones the kernel bootstrap mapping. This space is temporary and is freed when the program exits.
+  </Step>
+
+  <Step title="Map each PT_LOAD segment at its ELF virtual address">
+    Each `PT_LOAD` header is mapped into the isolated address space at the virtual address specified in the ELF. Loadable segments must fit inside the accepted user virtual-address window and stay below the per-segment size cap. BSS regions (the tail of a segment whose memory size exceeds its file size) are zero-filled.
+  </Step>
+
+  <Step title="Enter ring 3 for /ex programs and elfrun">
+    For programs in `/ex` and explicit `elfrun` invocations, the loader maps the image pages as user-accessible and uses `k64_usermode_execute_named()` / `k64_usermode_execute_named_ex()` to enter ring 3 through `iretq`. The kernel sets up a 64-bit TSS ring-0 fault/syscall stack, a user code descriptor, and a user data descriptor before the transition.
+  </Step>
+
+  <Step title="Ring-0 path for ELF-backed .k64s and .k64m">
+    ELF-backed service (`.k64s`) and driver (`.k64m`) modules use the older isolated ring-0 call path rather than the ring-3 transition. They execute under their own isolated CR3 but do not leave the kernel privilege level.
+  </Step>
+
+  <Step title="Exit, print exit code, and free the VM space">
+    On `exit` — whether from a clean `proc.exit` service call or a user-mode fault — the loader returns to the kernel, prints the exit code, marks the process record as `ZOMBIE`, and frees the temporary address space. The process record remains visible in `ps` until a parent reaps it with `waitpid`.
+  </Step>
+</Steps>
+
+## Split Execution Model
+
+The ELF loader enforces a deliberate split between two execution personalities:
+
+| Context | Entry path | Privilege | CR3 |
+|---|---|---|---|
+| `/ex/*.elf` user programs | `iretq` ring-3 transition | Ring 3 | Isolated user space |
+| ELF-backed `.k64s` services | Kernel function call | Ring 0 | Isolated service space |
+| ELF-backed `.k64m` drivers | Kernel function call | Ring 0 | Isolated service space |
+
+Only `/ex` programs and programs launched through `elfrun` or `k64_elf_execute_user_path()` enter ring 3. Services and drivers remain on the kernel side even when they are backed by an ELF binary at an `entry_path` such as `/ex/hello.elf`.
+
+## User-Mode Infrastructure
+
+`k64_usermode.c` provides the low-level ring-3 support that the ELF loader depends on:
+
+- **User code and data descriptors** added to the GDT
+- **64-bit TSS** with a dedicated ring-0 syscall/fault stack
+- **IDT gate at vector `0x80`** with DPL 3 — the int 0x80 syscall entry point
+- **`iretq`-based ring transition** into user mode
+- **Return path** back into the kernel on `exit` or on a user fault
+- **Process table** recording PID, parent PID, scheduler task ID, state, exit code, start/end ticks, runtime ticks, fault vector, fault RIP, and image path
+
+`ps` displays the full process table including state (`RUNNING`, `ZOMBIE`, `FAULTED`), exit code, runtime ticks, fault metadata, and image path for every K64-native ELF run.
+
+## Important Limits
+
+<Warning>
+  The current ELF loader is intentionally minimal. Keep these constraints in mind when building programs for K64:
+</Warning>
+
+- **No relocations beyond PT_LOAD copying** — the loader does not process `R_*` relocation entries
+- **No dynamic linker** — no `PT_INTERP` interpreter is launched for K64-native programs (KLCS handles Linux dynamic ELFs separately)
+- **No symbol resolution** — exported and imported symbol tables are not processed
+- **VA window** — loadable segments must fit inside the accepted user virtual-address window; addresses outside this range cause the load to fail
+- **ELF header validation** — program headers whose file ranges, memory ranges, or alignments overflow or contradict the file size are rejected
+- **Ring-3 path limited to `/ex`** — ELF-backed services and drivers still execute on the kernel side
+
+## Sample ELFs in `/ex`
+
+The default K64XFS image stages these programs into `/ex`:
+
+| Program | Description |
+|---|---|
+| `hello.elf` | Assembly-only program that uses the `int 0x80` syscall path to write text and exit from ring 3 |
+| `catmotd.elf` | Assembly-only program that opens and reads `/etc/motd` through the syscall layer, demonstrating user-mode file I/O |
+| `args.elf` | Demonstrates shell-style argument passing — for example, `args alpha beta` runs as `argc=3` |
+| `edit.elf` | A small nano-like text editor: arrow keys, `Enter`, `Backspace`/`Delete`, `Ctrl-S` to save, `Ctrl-Q` to quit |
+| `procinfo.elf` | Built from C against the K64 libc shim; demonstrates `getpid()` and uptime syscalls |
+| `libctest.elf` | Built from C; exercises string helpers, memory helpers, file open/read/close, process IDs, and uptime output |
+
+## Running ELF Programs
+
+Both explicit `elfrun` invocations and bare name execution are valid:
+
+```bash
+elfrun /ex/hello.elf
+hello
+```
+
+```bash
+elfrun /ex/args.elf alpha beta
+args alpha beta
+```
+
+The shell resolves a bare name by searching, in order: built-in commands, service commands, service names, driver names, and finally `/etc/path/inpath.cfg` entries (which include `/ex` by default).
+
+## Process Table
+
+`ps` shows the full user process table. Each entry records:
+
+| Field | Description |
+|---|---|
+| PID | Stable kernel-assigned process ID |
+| Parent PID | PID of the spawning process |
+| State | `RUNNING`, `ZOMBIE`, `FAULTED`, `EXITED`, or `REAPED` |
+| Exit code | Value passed to `proc.exit` |
+| Runtime ticks | PIT ticks accumulated while the process ran |
+| Fault vector | CPU exception vector if the process faulted |
+| Fault RIP | Instruction pointer at the time of the fault |
+| Image path | K64XFS path of the loaded ELF |
+
+<Note>
+  `ZOMBIE` records remain visible in `ps` until a parent calls `waitpid()` and reaps the child. Faulted processes record the exception vector and the RIP where the fault occurred, which is useful for diagnosing bad user-mode code.
+</Note>
+
+## Spawning and the Cooperative Process Model
+
+`k64_elf_spawn_user_path_args_ex()` queues a child process for execution and returns the child PID immediately. Child execution is cooperative-asynchronous: queued children run from explicit scheduler yield points (`sched.yield`, `sched.sleep`, and the shell/service poll loop) before the parent calls `waitpid()`. Blocking `waitpid()` with `K64_WAIT_BLOCK` can enter and collect a specific child. The ELF loader maintains a small nested execution context stack so parent/child ring-3 execution does not clobber the parent's loader state or syscall frame.
+
+<Tip>
+  Full per-user-task kernel stacks, saved user trap frames, and timer-preemptive ring-3 context switching are future work. The current model is cooperative-asynchronous rather than fully preemptive.
+</Tip>

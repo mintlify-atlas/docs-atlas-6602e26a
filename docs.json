@@ -1,72 +1,108 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "K64",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#2563EB",
+    "light": "#60A5FA",
+    "dark": "#1E3A6E"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/K64-Labs/K64"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/K64-Labs/K64"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "building"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/boot",
+              "architecture/memory",
+              "architecture/scheduler"
+            ]
+          },
+          {
+            "group": "Drivers & Services",
+            "pages": [
+              "runtime/driver-model",
+              "runtime/service-model",
+              "runtime/shell"
+            ]
+          },
+          {
+            "group": "Filesystem",
+            "pages": [
+              "filesystem/k64xfs",
+              "filesystem/commands",
+              "filesystem/grub-module"
+            ]
+          },
+          {
+            "group": "Userland",
+            "pages": [
+              "userland/elf-loader",
+              "userland/syscall-abi",
+              "userland/libc",
+              "userland/klcs"
+            ]
+          },
+          {
+            "group": "System Features",
+            "pages": [
+              "features/networking",
+              "features/users-permissions",
+              "features/kpm",
+              "features/storage"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Shell Commands",
+            "pages": [
+              "reference/shell-builtins",
+              "reference/service-commands",
+              "reference/fsctl-commands"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "reference/boot-config",
+              "reference/artifact-formats"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "reference/extending-k64",
+              "reference/testing"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

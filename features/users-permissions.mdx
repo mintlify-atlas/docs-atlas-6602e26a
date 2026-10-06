@@ -1,0 +1,141 @@
+---
+title: "K64 User and Permission System: Accounts, Groups, and Privilege"
+sidebarTitle: "Users & Permissions"
+description: "K64 implements a POSIX-like multiuser model with hashed passwords, UID/GID identity, mode-bit permission checks, sudo elevation, and the userctl service command surface."
+---
+
+K64's user and privilege system is implemented as the `userctl` service rather than as a hard-coded kernel subsystem. Accounts and groups are loaded from two plain text files in `/etc/`, and the kernel tracks numeric UID/GID identity at runtime to enforce owner/group/other mode-bit checks on filesystem operations, service management, ELF execution, and shell commands. The design is intentionally POSIX-like in structure while remaining lightweight enough to fit K64's experimental kernel scope.
+
+## Account Storage: `/etc/users.k64`
+
+Each line stores one account in this format:
+
+```text
+name:password-hash:role:sudo:primary-group
+```
+
+Example entries shipped with the default rootfs:
+
+```text
+root:k64$6d6216943f2b4f6b:root:1:root
+guest:k64$99cd30e2c16823eb:user:1:guest
+```
+
+| Field | Meaning |
+|-------|---------|
+| `name` | Account name |
+| `password-hash` | Hashed password string — `k64$...` prefix means it is already hashed; older plaintext entries are accepted for compatibility and rewritten on the next save |
+| `role` | `root` or `user` |
+| `sudo` | `1` = sudo-capable, `0` = no sudo |
+| `primary-group` | Default group for the account |
+
+## Group Storage: `/etc/groups.k64`
+
+Each line maps a group name to a comma-separated member list:
+
+```text
+group:user1,user2,user3
+```
+
+Example entries:
+
+```text
+root:root
+sudo:root,guest
+guest:guest
+```
+
+## Default Behavior When Files Are Missing or Empty
+
+If `/etc/users.k64` does not exist or is empty, K64 automatically creates two seed accounts and sets the initial session:
+
+- `root` with password `root` (role `root`, sudo `1`)
+- `guest` with password `guest` (role `user`, sudo `1`)
+- `guest` becomes the **initial current user**
+
+If `/etc/groups.k64` does not exist or is empty, K64 recreates the `root` and `sudo` system groups plus each user's own primary group. Primary-group membership and `sudo`-group membership are enforced automatically from the account database.
+
+## Home Directory Model
+
+| Path | Mode | Owner |
+|------|------|-------|
+| `/usr/<username>` | `0750` | Owning UID / primary GID |
+| `/tmp` | world-writable | — |
+| `/etc/users.k64` | `0600` | root |
+| `/etc/groups.k64` | `0644` | root |
+
+Home directories are created under `/usr/<username>` — the current K64 convention. `/tmp` is initialised as world-writable scratch space accessible to all users.
+
+## UID/GID Assignment
+
+| Identity | UID / GID |
+|----------|-----------|
+| `root` | `0` / `0` |
+| Regular users and groups | Starting at `1000` |
+
+Runtime UID/GID values are computed from the user database at boot. They are used by the kernel's permission checks but are **not yet persisted as on-image metadata** in the K64XFS inode format.
+
+## Privilege Rules
+
+K64 enforces a layered privilege model through the `k64_user_can_*` API:
+
+- **Service management**: root manages all services; non-root can only manage user-class services (`k64_user_can_manage_service()`).
+- **Driver management**: only root can manage drivers (`k64_user_can_manage_drivers()`).
+- **Sudo elevation**: a sudo-capable user elevates via `sudo`, `sudo on`, or `sudo <password>`, and drops elevation with `sudo off`. Root and sudo membership are reflected into the `root` and `sudo` groups.
+- **Mode-bit checks**: owner/group/other bits gate read (`K64_ACCESS_READ`), write (`K64_ACCESS_WRITE`), and execute (`K64_ACCESS_EXEC`) for every `io.open`, `fs.*` service call, `proc.spawn`, ELF execution, and `fsctl` operation that flows through the service-backed filesystem API (`k64_user_can_access()`).
+
+## userctl Command Reference
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `userctl` | Print userctl service status | `userctl` |
+| `users` | List all accounts, roles, primary groups, and session state | `users` |
+| `groups [user]` | List all groups, or show groups for one user | `groups alice` |
+| `whoami` | Print the current effective username | `whoami` |
+| `id` | Show real user, effective user, primary group, supplemental groups, and home | `id` |
+| `login` | Log in interactively (prompts for user and password) | `login` |
+| `logout` | Log out the current session | `logout` |
+| `su` | Switch user (prompts for credentials) | `su` |
+| `sudo` / `sudo on` | Enable effective root for the current session | `sudo on` |
+| `sudo off` | Drop effective root | `sudo off` |
+| `sudo <password>` | Password-checked elevation | `sudo hunter2` |
+| `passwd` | Change the current user's password | `passwd` |
+| `useradd <user> <password> [user\|sudo\|root] [primary-group]` | Create an account | `useradd alice hunter2 sudo staff` |
+| `userdel <user>` | Delete a non-root account | `userdel alice` |
+| `usermod role <user> <user\|sudo\|root>` | Change role / sudo capability | `usermod role alice root` |
+| `usermod primary <user> <group>` | Change the primary group | `usermod primary alice staff` |
+| `usermod groupadd <user> <group>` | Add a user to a supplemental group | `usermod groupadd alice ops` |
+| `usermod groupdel <user> <group>` | Remove a user from a supplemental group | `usermod groupdel alice ops` |
+| `groupadd <group>` | Create a group | `groupadd staff` |
+| `groupdel <group>` | Delete a group (if not essential or used as a primary group) | `groupdel staff` |
+| `gpasswd add <group> <user>` | Add a user to a group | `gpasswd add staff guest` |
+| `gpasswd del <group> <user>` | Remove a user from a group | `gpasswd del staff guest` |
+
+## Usage Examples
+
+```text
+users
+groups
+login guest guest
+sudo guest
+whoami
+useradd alice hunter2 sudo staff
+groupadd staff
+gpasswd add staff guest
+usermod role alice root
+passwd alice newpass
+```
+
+## Installer Account Creation
+
+Before running `install <device> yes`, you can create a persistent login account with:
+
+```text
+install user <name> <password> [sudo]
+```
+
+This calls `k64_user_create_account()` and writes the account to `/etc/users.k64` before the filesystem image is written to the target disk, so the installed system boots with your own credentials rather than just the default `guest` account.
+
+<Warning>
+The current password scheme is intentionally lightweight. Passwords are hashed with a built-in `k64$...` scheme rather than a production cryptographic stack such as bcrypt or Argon2. This is better than plaintext storage, but it is **not a production authentication system**. Additionally, UID/GID ownership is runtime metadata rebuilt from the user database on each boot — it is **not yet part of the K64XFS on-image inode format**.
+</Warning>

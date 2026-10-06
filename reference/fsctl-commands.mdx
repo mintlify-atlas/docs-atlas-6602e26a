@@ -1,0 +1,125 @@
+---
+title: "K64 Filesystem Command Reference: fsctl, xfsctl, and Shell File Ops"
+sidebarTitle: "Filesystem Commands"
+description: "Complete reference for K64 filesystem shell commands, fsctl service commands for runtime filesystem operations, and xfsctl for disk image tooling and diagnostics."
+---
+
+K64 exposes filesystem operations through three distinct surfaces: standard shell file operations registered by the `fsctl` service, the `xfsctl` service for low-level K64XFS disk image tooling and diagnostics, and `storagectl` for volume-level operations against the mounted root. All commands operate on the K64XFS (`K64XFS`) filesystem — the standard K64 root format used by both the kernel and the GRUB-side module. Changes are held in a 64-block write-back cache and must be explicitly flushed with `sync` to persist to the backing block device.
+
+---
+
+## Standard Shell Filesystem Operations
+
+These commands are registered by the `fsctl` service and available at the shell prompt. They operate on the mounted K64XFS root filesystem through the kernel's `k64_fs_*` helpers.
+
+| Command | Syntax | Description | Example |
+|---|---|---|---|
+| `pwd` | `pwd` | Print the current working directory | `pwd` → `/usr/guest` |
+| `ls` | `ls [path]` | List directory contents; defaults to the current directory | `ls /etc` |
+| `cd` | `cd <path>` | Change the current working directory | `cd /tmp` |
+| `mkdir` | `mkdir <path>` | Create a directory (and intermediate parents as needed) | `mkdir /tmp/demo` |
+| `touch` | `touch <path>` | Create an empty file, or update a file's metadata if it already exists | `touch /tmp/notes.txt` |
+| `write` | `write <path> <text>` | Write text to a file, replacing any existing content | `write /tmp/demo/note hello` |
+| `append` | `append <path> <text>` | Append text to an existing file | `append /tmp/demo/note -world` |
+| `cat` | `cat <path>` | Print a file's contents to the terminal | `cat /etc/motd` |
+| `stat` | `stat <path>` | Print file metadata (see fields below) | `stat /tmp/demo/note` |
+| `rm` | `rm <path>` | Remove a file | `rm /tmp/demo/note` |
+| `rmdir` | `rmdir <path>` | Remove an empty directory | `rmdir /tmp/demo` |
+| `mv` | `mv <src> <dst>` | Move or rename a file or directory | `mv /tmp/demo/note /tmp/demo/moved` |
+| `cp` | `cp <src> <dst>` | Copy a file to a new path | `cp /etc/motd /tmp/motd-copy` |
+| `sync` | `sync` | Flush all dirty K64XFS cache blocks to the backing block device | `sync` |
+
+### `stat` Output Fields
+
+`stat` reports the following metadata for a file or directory:
+
+| Field | Description |
+|---|---|
+| Type | `file` or `directory` |
+| Size | File size in bytes |
+| Mode | Permission bits in octal (e.g. `0644`, `0755`) |
+| UID | Owner user ID |
+| GID | Owner group ID |
+| Generation | Inode generation counter |
+| Timestamp | Last-modified time in K64XFS format |
+
+---
+
+## `fsctl` Service Commands
+
+The `fsctl` service also registers higher-level service commands for runtime filesystem operations, including POSIX-like permission management. All read/write operations are the same as the shell commands above, plus:
+
+### Root-Only Administration
+
+| Command | Syntax | Description |
+|---|---|---|
+| `chmod` | `chmod <mode> <path>` | Change the permission bits on a file or directory. `<mode>` is an octal integer such as `0644` or `0755`. Requires effective root. |
+| `chown` | `chown <user>:<group> <path>` | Change the runtime owner and group of a file or directory. Requires effective root. |
+
+<Note>
+`chmod` and `chown` are root-only operations. Non-root users attempting them will receive a permission error. Use `sudo` or `sudo on` to elevate before calling these commands.
+</Note>
+
+Permission checks are enforced at the service-call, ELF-loader, and `io.open` / `fs.*` service-call layers. K64XFS persists mode bits in the on-disk inode, but UID/GID ownership is currently runtime metadata rebuilt from the user database during boot. See `docs/fs/k64xfs.md` for the full on-disk layout.
+
+---
+
+## `xfsctl` — K64XFS Tooling and Diagnostics
+
+The `xfsctl` service provides a low-level command surface for formatting, inspecting, and exercising K64XFS images. It is primarily useful for development, image tooling, and debugging the K64XFS filesystem layer directly without going through the mounted root.
+
+| Command | Description |
+|---|---|
+| `xfsctl format` | Format a raw block device or image file as K64XFS; writes the superblock, inode bitmap, block bitmap, journal area, and root directory inode |
+| `xfsctl mount` | Attempt to mount and validate a K64XFS image; reports superblock fields and validation result |
+| `xfsctl info` | Print the mounted volume's superblock details: magic, version, block size, total blocks, free blocks, root inode, UUID, label, generation, and checksum |
+| `xfsctl list` | List directory contents at a given path inside the image |
+| `xfsctl stat` | Print inode metadata for a path inside the image (same fields as `stat`) |
+| `xfsctl mkdir` | Create a directory inside the image |
+| `xfsctl write` | Write data to a file path inside the image |
+| `xfsctl append` | Append data to a file path inside the image |
+| `xfsctl cat` | Print a file's contents from inside the image to the terminal |
+| `xfsctl remove` | Remove a file from the image |
+| `xfsctl chmod` | Change permission bits on a path inside the image |
+| `xfsctl chown` | Change owner/group on a path inside the image |
+| `xfsctl sync` | Flush dirty cache blocks for the image to the backing device |
+| `xfsctl check` | Run the read-only K64XFS checker: validate superblock geometry, checksums, inode table integrity, bitmap consistency, and directory structure |
+
+<Note>
+The `xfsctl check` command is read-only. It validates metadata but does not repair inconsistencies. The journal skeleton records dirty state but full crash recovery is not yet implemented.
+</Note>
+
+---
+
+## `storagectl` Filesystem Operations
+
+The `storagectl` service exposes volume-level operations that complement the per-file `fsctl` surface.
+
+| Command | Description |
+|---|---|
+| `storagectl root` | Report the mounted rootfs source (block device or Multiboot module path), whether it is in persistent or ephemeral mode, and the K64XFS used/free/total volume capacity |
+| `storagectl sync` | Explicitly flush the mounted K64XFS image back to the block device; equivalent to `sync` but scoped to the storage control plane |
+| `grow /` | Refresh the mounted K64XFS root volume capacity from the backing partition geometry — useful after the disk image has been resized or the partition table has been rewritten |
+
+---
+
+## Persistence Notes
+
+<CardGroup cols={2}>
+  <Card title="Persistent Mode" icon="hard-drive">
+    When booted with the default attached `build/root.disk`, the ATA driver registers the disk as `ata0`, the filesystem driver mounts the K64XFS partition from `ata0p1`, and all mutations that are flushed with `sync` survive reboot.
+  </Card>
+  <Card title="Ephemeral Mode" icon="compact-disc">
+    When booted ISO-only (no writable disk attached), K64 uses the `root.xfs` Multiboot module loaded from the ISO into memory. All filesystem changes are held in RAM and are lost on reboot.
+  </Card>
+</CardGroup>
+
+Run `storagectl root` to confirm which mode the running system is using before making changes you expect to persist.
+
+---
+
+## Path Component Length
+
+<Warning>
+K64XFS enforces a maximum name length for path components. Any path component that exceeds the supported length is **rejected with an error** rather than silently truncated. This applies to `mkdir`, `touch`, `write`, `mv`, `cp`, and all other path-taking commands. Keep directory and file names within the supported limit to avoid rejection.
+</Warning>

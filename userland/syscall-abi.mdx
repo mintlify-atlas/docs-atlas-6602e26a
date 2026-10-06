@@ -1,0 +1,181 @@
+---
+title: "K64 Userland Syscall ABI and Service-Call Gate"
+sidebarTitle: "Syscall ABI"
+description: "K64's userland ABI centers on syscall 25 (service_call), a typed gate that dispatches named service methods from ring-3 processes into native K64 services."
+---
+
+K64's ring-3 userland communicates with the kernel through a single public syscall gate. Rather than exposing dozens of feature-specific syscall numbers, K64 consolidates all user-to-kernel communication into syscall 25 (`service_call`), a typed dispatch gate that routes named service methods — such as `io.write`, `proc.spawn`, or `sched.sleep` — from ring-3 user programs into native K64 services. All older syscall numbers (0–24) are no longer public userland ABI and return `K64_ERR_NOSYS`.
+
+## Active Syscall: service_call (25)
+
+Syscall 25 is the only public userland ABI gate:
+
+```c
+// Userland invocation — place a pointer to a k64_service_call_user_t in rdi,
+// then raise int 0x80 with syscall number 25 in rax.
+typedef struct {
+    const char* service;      // e.g. "io", "fs", "proc"
+    const char* method;       // e.g. "write", "open", "spawn"
+    const void* request;      // pointer to request payload in user VA
+    uint64_t    request_len;  // length of request payload
+    void*       response;     // pointer to response buffer in user VA
+    uint64_t    response_len; // length of response buffer
+    uint64_t    flags;        // reserved, must be zero
+} k64_service_call_user_t;
+```
+
+Syscall numbers 0–24 are defined in `k64_usermode.h` for legacy reference but return `K64_ERR_NOSYS` when invoked from ring 3. The libc function names for those older operations remain, but they now marshal requests as named service calls (for example, `io.write`, `io.open`, `fs.stat`, `proc.wait`, `sched.sleep`, `term.size`).
+
+## How service_call Works
+
+<Steps>
+  <Step title="User program fills a k64_service_call_user_t">
+    The user program allocates a `k64_service_call_user_t` on its stack or in a static buffer, fills in the service name, method name, request pointer, request length, response pointer, and response length, then invokes `int 0x80` with `rax = 25` and `rdi` pointing to the struct.
+  </Step>
+
+  <Step title="Kernel copies user input into bounded kernel buffers">
+    The syscall handler reads the struct through VMM-checked user-memory helpers. Service-name and method-name strings are copied into fixed kernel-side buffers. The request payload is copied from user virtual address space into a bounded kernel staging buffer. Malformed or unmapped user pointers return `K64_ERR_*` errors immediately without dereferencing the pointer as a kernel address.
+  </Step>
+
+  <Step title="Dispatch through the service registry">
+    The kernel looks up the named service and method in the service registry. Services must pass the Ring-3 verification gate (v0.3.29) before their methods can dispatch. Only the literal `kernel` service is exempt and remains Ring 0.
+  </Step>
+
+  <Step title="Service executes and produces a response">
+    The matched service method runs with the bounded kernel-side request data. It writes its output into a kernel response buffer.
+  </Step>
+
+  <Step title="Kernel copies response back through checked user mappings">
+    The response buffer is written back to the user-provided response pointer only through checked user mappings. Outputs such as `read`, `pipe`, `fb_info`, `proc_info`, and `list_dir` are never written directly to user memory without a mapping check.
+  </Step>
+</Steps>
+
+## Security Model
+
+<Warning>
+  Kernel-to-user outputs are written only through VMM-checked user mappings. Unchecked user pointer dereferences are not permitted in the syscall path.
+</Warning>
+
+The service-call gate enforces several security invariants:
+
+- **Checked copies in both directions**: service-call strings and byte buffers are copied through VMM-checked user-memory helpers rather than being dereferenced as kernel pointers
+- **Bounded writes**: large user writes are bounded before the filesystem sees them; text framebuffer blits are copied into a bounded kernel staging buffer before drawing
+- **Checked outputs**: kernel-to-user outputs (`read`, `pipe`, `fb_info`, `proc_info`, `list_dir`) are written back only through checked user mappings
+- **Stable error codes**: malformed user pointers return stable `K64_ERR_*` errors instead of letting user programs read or write arbitrary kernel addresses
+- **Ring-3 verification gate** (v0.3.29): only the `kernel` service is Ring 0; `fs`, `proc`, `io`, `sched`, `term`, `svc`, and all user services must pass Ring-3 verification before their commands or calls dispatch
+
+## Named Service Methods Available to Userland
+
+### I/O and File Descriptors
+
+| Method | Description |
+|---|---|
+| `io.write` | Write bytes to a file descriptor (stdout, stderr, or an open fd) |
+| `io.open` | Open a K64XFS file and return an fd ≥ 3 |
+| `io.read` | Read bytes from an open fd into a user buffer |
+| `io.pipe` | Create an anonymous read/write pipe backed by a kernel ring buffer |
+
+### Filesystem
+
+| Method | Description |
+|---|---|
+| `fs.stat` | Return metadata (`k64_stat_t`) for a path |
+| `fs.list_dir` | Return directory entries for a path |
+| `fs.write_file` | Write a complete file (whole-file save) |
+| `fs.move` | Move or rename a file within K64XFS |
+
+### Process Control
+
+| Method | Description |
+|---|---|
+| `proc.getpid` | Return the PID of the calling process |
+| `proc.info` | Return `k64_proc_info_t` metadata for a PID |
+| `proc.spawn` | Spawn a child ELF from `/ex`; returns child PID immediately |
+| `proc.wait` | Wait for a child PID; supports `K64_WAIT_BLOCK` and `K64_WAIT_NOHANG` |
+| `proc.exit` | Exit the calling user process with a given exit code |
+
+### Scheduler
+
+| Method | Description |
+|---|---|
+| `sched.yield` | Yield the current time-slice back to the scheduler |
+| `sched.sleep` | Sleep for a specified number of PIT ticks |
+
+### Terminal
+
+| Method | Description |
+|---|---|
+| `term.size` | Return the current terminal dimensions |
+| *(cursor control)* | Move and query the hardware cursor |
+| *(text cell blitting)* | Blit styled text cells to the VGA framebuffer through a bounded staging buffer |
+
+### Kernel Info
+
+| Method | Description |
+|---|---|
+| `kernel.version` | Return the running kernel version string |
+| `kernel.uptime` | Return the current uptime in PIT ticks |
+
+### KLCS
+
+| Method | Description |
+|---|---|
+| `klcs.status` | Return KLCS status text |
+| `klcs.syscalls` | Return the Linux syscall support table |
+| `klcs.syscall` | Dispatch one staged Linux syscall frame (`klcs_linux_syscall_frame_t`) |
+| `klcs.trace.enable` | Enable KLCS syscall tracing |
+| `klcs.trace.disable` | Disable KLCS syscall tracing |
+| `klcs.trace.dump` | Return the recent trace ring buffer |
+
+## File Descriptor Model
+
+Each active user process has a small fd table:
+
+- **fd 0, 1, 2**: stdin, stdout, stderr — pre-assigned at process start
+- **fd ≥ 3**: returned by `io.open`; validated by `io.read` and `io.close`
+- `stat()` exposes K64XFS metadata through the fd model
+- `io.pipe()` creates anonymous read/write endpoints backed by fixed kernel ring buffers
+- File writes are primarily whole-file saves through `fs.write_file`; writable fd-based streaming is early-stage
+
+## Process Model
+
+`proc.spawn` returns the child PID immediately and records parent/child ownership. As of v0.3.32, child execution is cooperative-asynchronous: queued children run from `sched.yield`, `sched.sleep`, and the shell/service poll loop before the parent calls `proc.wait`.
+
+`proc.wait` supports two wait flags:
+
+| Flag | Value | Behavior |
+|---|---|---|
+| `K64_WAIT_BLOCK` | `0` | Block until the child exits; enters child context if needed |
+| `K64_WAIT_NOHANG` | `1` | Return immediately; returns `K64_ERR_AGAIN` if child is still running |
+
+Process state machine:
+
+```text
+RUNNING  →  ZOMBIE  (after proc.exit or fault)
+ZOMBIE   →  REAPED  (after parent calls waitpid)
+RUNNING  →  FAULTED (after unhandled CPU exception in ring 3)
+```
+
+`waitpid` enforces direct parent-child ownership — a process cannot wait on a PID it did not spawn.
+
+## Permission Model
+
+### Ring-3 Verification Gate (v0.3.29)
+
+After v0.3.29, the service registry enforces that only the literal `kernel` service can operate at Ring 0. Every other service — `fs`, `proc`, `io`, `sched`, `term`, `svc`, and all user-class services — must pass Ring-3 verification before any service command or service call dispatches.
+
+### POSIX-like Permission Core (v0.3.22)
+
+v0.3.22 introduced a multiuser permission core. Service calls that touch files or processes check owner/group/other read, write, and execute bits:
+
+- `io.open` — checks read/write bits on the target file
+- `fs.*` service calls — check mode bits for the path being accessed or mutated
+- `proc.spawn` — checks execute permission on the target ELF
+- ELF execution — checks execute bits before the loader maps segments
+- `fsctl` operations — check ownership and mode bits
+
+Root elevation (UID 0) bypasses mode-bit checks. `sudo` on the shell session sets the effective UID to 0 for the duration of the elevated session.
+
+<Note>
+  UID/GID ownership persistence in the K64XFS on-image format is still in progress. Runtime UID/GID identity is rebuilt from the user database during boot and enforced at the service-call and ELF-loader layers.
+</Note>

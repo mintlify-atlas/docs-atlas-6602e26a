@@ -1,0 +1,149 @@
+---
+title: "K64 Interactive Shell: Service-Backed Command Line"
+sidebarTitle: "Shell"
+description: "The K64 shell is a managed async service with PS/2 and serial input, command history, cursor editing, keyboard layout switching, and a four-stage command dispatch chain."
+---
+
+The K64 shell is not a hard-coded foreground loop in the kernel core. It is a managed async service named `shell`, registered and started by `init` like any other service in the K64 runtime. Its lifecycle callbacks (`k64_shell_service_start`, `k64_shell_service_stop`, `k64_shell_service_poll`) are declared in `k64_shell.h`, and the PIT-driven scheduler calls its poll function on each tick — meaning the shell coexists with async drivers, network polling, and other service workers rather than monopolising the CPU in a blocking spin loop.
+
+## Prompt Format
+
+The shell prompt follows the pattern:
+
+```text
+[user]@K64 ~[path] >>>
+```
+
+The `user` segment reflects the currently logged-in account. Examples:
+
+```text
+[guest]@K64 ~/ >>>
+[root]@K64 ~/usr/root >>>
+```
+
+The prompt updates live when you change directories (`cd`) or switch users (`login`, `su`, `sudo`).
+
+## Input Sources
+
+The shell accepts input from two sources simultaneously:
+
+- **PS/2 keyboard driver** — the primary input path on all supported hardware and in QEMU
+- **Serial COM1** — when the kernel detected and loopback-tested COM1 successfully at boot, the shell also reads from the serial port, enabling headless operation over a terminal emulator
+
+<Tip>
+Run `serial` at the shell to find out whether COM1 was detected at boot. If the serial driver is absent (common on real hardware without a legacy serial port), K64 falls back to VGA-only console output and keyboard-only input without error.
+</Tip>
+
+## Editing Features
+
+The shell line editor supports:
+
+- **Left / right arrow keys** — move the cursor within the current input without retyping
+- **Up / down arrow keys** — navigate command history (most recent first)
+- **Backspace** — delete the character before the cursor
+- **Forward delete** — delete the character at the cursor position
+- **VGA hardware cursor** — the visible blinking cursor position is updated in real time as you move and edit, including re-enabling the cursor when GRUB or firmware left it disabled
+
+## Keyboard Layout Switching
+
+The shell supports US and German keyboard layouts out of the box:
+
+| Command | Effect |
+|---|---|
+| `layout us` | Switch to the US QWERTY layout |
+| `layout de` | Switch to the German QWERTZ layout |
+
+The active layout is loaded from `/etc/keyboard/layout.cfg` when the shell starts. Running `layout us` or `layout de` changes the live mapping, writes the new value back to that config file, and calls `k64_fs_sync()` when a persistent root is available.
+
+The PS/2 keyboard path tracks Shift, Ctrl, Escape, and AltGr (Right Alt). The German layout includes AltGr combinations such as `AltGr+Q` for `@`, bracket and brace keys, backslash, pipe, and tilde.
+
+## Login Gate
+
+The shell starts behind a login gate. You must authenticate before reaching the prompt.
+
+<Info>
+Live systems (booted from the ISO without installing) keep `guest / guest` credentials for quick evaluation and smoke tests. Installed systems should create their own accounts during installation using `install user <name> <password> [sudo]` or the interactive installer wizard.
+</Info>
+
+## Built-in Shell Commands
+
+These commands are owned directly by the shell itself — they are parsed before the service command registry is consulted:
+
+| Command | Description |
+|---|---|
+| `help` | Print a summary of available built-in commands |
+| `clear` | Clear the VGA text-mode terminal screen |
+| `ticks` | Print the current PIT tick counter value |
+| `task` | Show the kernel task currently running in the scheduler |
+| `ps` | List active user ELF processes: PID, parent PID, state, exit code, ticks, and image path |
+| `serial` | Report whether COM1 serial was successfully detected and enabled at boot |
+| `sched` | Show scheduler task table: state, priority, remaining/base slice, run ticks, wait ticks |
+| `echo` | Print the remainder of the command line to the terminal |
+| `layout` | Switch the keyboard layout: `layout us` or `layout de` |
+| `yield` | Yield the current execution slice back to the scheduler |
+| `panic` | Trigger an immediate kernel panic (diagnostic use) |
+| `reboot` | Perform a machine-level reboot (QEMU and compatible legacy hardware) |
+| `shutdown` | Perform a machine-level shutdown |
+
+<Warning>
+`panic` is a deliberate kernel panic and will halt the system immediately. It exists for diagnostic and test purposes only.
+</Warning>
+
+## Four-Stage Command Dispatch
+
+When you enter a command at the `>>>` prompt, the shell resolves it through four ordered stages:
+
+<Steps>
+  <Step title="Shell built-ins">
+    The shell checks the command against the list of built-ins it owns directly: `help`, `clear`, `ticks`, `task`, `ps`, `serial`, `sched`, `echo`, `layout`, `yield`, `panic`, `reboot`, `shutdown`, and a small number of others such as `sudo` and `sync`. If matched, the handler is invoked immediately without involving the service registry.
+  </Step>
+  <Step title="Service command registry">
+    The shell calls `k64_system_dispatch_command(command, args)`. The registry iterates all commands registered by running services and invokes the first matching handler. This is how commands like `ls`, `cat`, `write`, `mkdir`, `servicectl`, `driverctl`, `netctl`, `ping`, `kcurl`, `users`, `login`, and hundreds of others reach their implementations — each is registered by the owning service (e.g. `fsctl`, `netctl`, `userctl`) when that service starts.
+  </Step>
+  <Step title="Start service or driver by name">
+    If the command still has no match, the shell tries `k64_system_start_service_by_name(command)`. If a `.k64s` file exists in `/k64s` for that name, the service is loaded and started. If that also fails, it tries `k64_modules_start_driver_by_name(command)`, loading the matching `/k64m/<name>.k64m` driver. This is what lets you type `hello` at the prompt to start the `hello` service backed by `/ex/hello.elf`.
+  </Step>
+  <Step title="Path search via /etc/path/inpath.cfg">
+    As a final fallback the shell consults `/etc/path/inpath.cfg`. Each line is a directory. The shell tries `<dir>/<command>.elf` for K64-native ELFs and `<dir>/<command>` for staged Linux ELFs. The default entries are:
+
+    ```text
+    /ex
+    /compat/linux/bin
+    /compat/linux/usr/bin
+    ```
+
+    This lets native K64 ELFs in `/ex` (such as `hello.elf`, `catmotd.elf`, `edit.elf`) and KLCS-staged Linux ELFs (such as `tcc`, `nano`, `git`) run by bare name without typing a full path.
+  </Step>
+</Steps>
+
+<Note>
+The four-stage chain is why `servicectl` works both as a service name you can start (`servicectl start 1001`) and as a command surface whose subcommands (`list`, `stop`, `restart`) are dispatched through the service registry. The same mechanism applies to `driverctl`, `fsctl`, `netctl`, `userctl`, and every other control service.
+</Note>
+
+## Example Session
+
+```text
+[guest]@K64 ~/ >>> serial
+serial: COM1 detected
+
+[guest]@K64 ~/ >>> layout de
+layout: de
+
+[guest]@K64 ~/ >>> servicectl list
+PID   STATE    CLASS   HOST     NAME              VM BASE
+0     running  kernel  ring0    kernel            0x0000000000000000
+1000  running  system  ring3    servicectl        0x0000000041000000
+...
+
+[guest]@K64 ~/ >>> ls /
+bin  boot  dev  etc  ex  home  k64m  k64s  lib  mnt  proc  README  run  srv  tmp  usr  var
+
+[guest]@K64 ~/ >>> hello
+[hello exits with code 0]
+
+[guest]@K64 ~/ >>> sched
+TASK  STATE    PRI  SLICE  BASE  RUN    WAIT   NAME
+0     running  4    10     10    12304  0      shell (current)
+1     ready    2    20     20    8802   4      rtl8139
+...
+```

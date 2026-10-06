@@ -1,0 +1,174 @@
+---
+title: "K64 Test Suite: Host Tests, Smoke Tests, and Unit Tests"
+sidebarTitle: "Testing"
+description: "K64's test suite covers shell command parsing, filesystem mutation, boot smoke, ring-3 ELF execution, persistence across reboots, networking, and GRUB config validation."
+---
+
+K64's test suite is intentionally small and targeted. It does not aim for broad runtime verification — instead, it protects the packaging path, parser logic, filesystem mutation behavior, shell command surface, boot path, and the first user-mode execution path. The suite runs host-side C unit tests for fast parser and filesystem feedback, and Python-driven QEMU serial sessions for smoke coverage of everything that requires a real running kernel.
+
+## Running the Full Suite
+
+After a successful `make`, run all tests with:
+
+```bash
+make test
+```
+
+This expands to the following sequence (from the `Makefile`):
+
+```bash
+bash tests/run_host_tests.sh
+bash tests/check_grub_cfg.sh
+bash tests/boot_smoke_test.sh
+bash tests/disk_boot_smoke_test.sh
+python3 tests/install_boot_smoke.py
+python3 tests/shell_smoke.py
+K64_SMOKE_ATTACH_DISK=0 python3 tests/shell_smoke.py
+K64_SMOKE_NET_DEVICE=e1000 python3 tests/shell_smoke.py
+python3 tests/user_elf_smoke.py
+python3 tests/persistence_smoke.py
+```
+
+<Note>
+The full suite requires **QEMU**, **Python 3**, and a successfully built `k64.iso` plus `build/root.disk`. Run `make` before `make test` if you have not already.
+</Note>
+
+## Test Files
+
+### Host-Side Unit Tests
+
+These run without QEMU and give fast feedback on parser and filesystem logic. `tests/run_host_tests.sh` compiles and runs all of them:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+CC="${CC:-gcc}"
+CFLAGS="${CFLAGS:--O2 -Wall -Wextra -std=c11 -fno-builtin}"
+
+"$CC" $CFLAGS -o tests/.shell_cmd_test tests/shell_cmd_test.c k64_shell_cmd.c
+./tests/.shell_cmd_test
+
+"$CC" $CFLAGS -o tests/.string_test tests/string_test.c k64_string.c
+./tests/.string_test
+
+"$CC" $CFLAGS -o tests/.fs_unit_test \
+    tests/fs_unit_test.c k64_fs.c k64_xfs.c k64_xfs_format.c \
+    k64_xfs_cache.c k64_xfs_journal.c k64_block.c k64_string.c
+./tests/.fs_unit_test
+
+"$CC" $CFLAGS -o tests/.xfs_unit_test \
+    tests/xfs_unit_test.c k64_xfs.c k64_xfs_format.c \
+    k64_xfs_cache.c k64_xfs_journal.c k64_block.c k64_string.c
+./tests/.xfs_unit_test
+
+"$CC" $CFLAGS -o tests/.kpm_unit_test \
+    tests/kpm_unit_test.c k64_kpm.c k64_fs.c k64_xfs.c k64_xfs_format.c \
+    k64_xfs_cache.c k64_xfs_journal.c k64_block.c k64_string.c
+./tests/.kpm_unit_test
+
+"$CC" $CFLAGS -DK64_HOST_TEST -o tests/.klcs_unit_test \
+    tests/klcs_unit_test.c k64_klcs.c k64_string.c
+./tests/.klcs_unit_test
+```
+
+| File | What it tests |
+|---|---|
+| `tests/shell_cmd_test.c` | Shell command parsing — tokenization, argument splitting, edge cases |
+| `tests/string_test.c` | String helper behavior — `k64_string.c` utilities |
+| `tests/fs_unit_test.c` | Filesystem mutation and lookup — `mkdir`, `write`, `rm`, path resolution against an in-memory K64XFS image |
+| `tests/xfs_unit_test.c` | K64XFS-specific format tests — superblock validation, bitmap operations, inode handling |
+| `tests/kpm_unit_test.c` | KPM package manager — source config parsing, install name validation, CRC32 verification, package kind dispatch |
+| `tests/klcs_unit_test.c` | KLCS (K64 Linux Compatibility Service) — errno mapping, path translation, file descriptor reuse, syscall dispatch, trace logging, ELF validation |
+
+### GRUB Config Validation
+
+```bash
+bash tests/check_grub_cfg.sh
+```
+
+Validates that the generated GRUB bootstrap and rootfs configs have correct syntax and expected content. Protects the packaging path from build regressions that silently produce a non-bootable ISO.
+
+### Boot Smoke Tests
+
+| Script | What it does |
+|---|---|
+| `tests/boot_smoke_test.sh` | Boots K64 in QEMU with `k64.iso` and the attached `build/root.disk`; validates that the kernel initializes, drivers start, and the shell prompt appears |
+| `tests/disk_boot_smoke_test.sh` | Boots directly from `build/root.disk` without the ISO to verify that the standalone disk image (BIOS boot area + K64XFS partition) boots correctly |
+| `tests/install_boot_smoke.py` | Smoke test for the installer flow: boots in `boot_mode=installer`, validates installer guidance output and target disk enumeration |
+
+<Tip>
+Boot smoke tests drive QEMU through a serial session: they send commands over the serial port and match expected output patterns. They are the primary way to catch regressions in the boot path and shell initialization sequence.
+</Tip>
+
+### Shell Smoke Tests
+
+`tests/shell_smoke.py` is the most comprehensive smoke test. It boots K64 in QEMU, attaches a serial session, and exercises:
+
+- Shell built-in commands (`help`, `clear`, `ps`, `sched`, `echo`, etc.)
+- Service commands (`servicectl list`, `driverctl list`, `storagectl list`, `fsctl`, etc.)
+- Filesystem commands (`ls`, `mkdir`, `write`, `cat`, `stat`, `rm`, `rmdir`, `mv`, `cp`, `sync`)
+- User and session commands (`whoami`, `users`, `groups`, `login`, `sudo`)
+- ELF launch from the shell prompt
+
+It runs three times in `make test` with different configurations:
+
+| Invocation | Mode |
+|---|---|
+| `python3 tests/shell_smoke.py` | Default disk-root mode: `build/root.disk` attached, K64XFS mounted as persistent root |
+| `K64_SMOKE_ATTACH_DISK=0 python3 tests/shell_smoke.py` | ISO-only mode: no disk attached; kernel falls back to the Multiboot `root.xfs` module |
+| `K64_SMOKE_NET_DEVICE=e1000 python3 tests/shell_smoke.py` | e1000 NIC mode: boots with QEMU's Intel e1000 device instead of RTL8139; validates network command discovery for VMware-compatible NIC behavior |
+
+### Ring-3 ELF Smoke Test
+
+```bash
+python3 tests/user_elf_smoke.py
+```
+
+Exercises the full ring-3 user-mode execution path:
+
+- Runs `/ex/*.elf` programs via `elfrun`
+- Validates ring-3 console output reaching the serial session
+- Checks that launched processes appear in `ps` output with correct PID, state, and image path
+- Exercises user-mode file I/O syscalls: `io.open`, `io.read`, reading from K64XFS in ring 3
+- Validates libc smoke coverage through `/ex/libctest.elf`
+
+### Persistence Smoke Test
+
+```bash
+python3 tests/persistence_smoke.py
+```
+
+Validates that filesystem writes survive a QEMU reboot:
+
+1. **First boot** — writes data to `build/root.disk` using shell commands (`write`, `mkdir`, `sync`).
+2. **Reboot** — restarts QEMU with the same `build/root.disk` image.
+3. **Second boot** — reads back the data written in the first boot and verifies it is present and correct.
+
+This protects the K64XFS write path, the ATA PIO block driver, and the `sync`/flush path from silent regressions.
+
+## Environment Variables
+
+| Variable | Effect |
+|---|---|
+| `K64_SMOKE_ATTACH_DISK=0` | Runs shell smoke without attaching `build/root.disk`. K64 uses the Multiboot `root.xfs` module from the ISO instead. Tests the ISO-only/live-mode code path. |
+| `K64_SMOKE_NET_DEVICE=e1000` | Substitutes QEMU's `e1000` device for the default `rtl8139`. Validates Intel e1000 NIC initialization and `netctl` command availability for VMware-compatible VM configurations. |
+
+## Test Suite at a Glance
+
+| File | Category | What it covers |
+|---|---|---|
+| `tests/run_host_tests.sh` | Host runner | Builds and runs all C unit tests |
+| `tests/check_grub_cfg.sh` | GRUB | Generated config correctness |
+| `tests/boot_smoke_test.sh` | Boot | ISO + disk boot; kernel init; shell prompt |
+| `tests/disk_boot_smoke_test.sh` | Boot | Standalone `build/root.disk` boot without ISO |
+| `tests/install_boot_smoke.py` | Boot | Installer flow smoke |
+| `tests/shell_smoke.py` | Shell | Built-ins, service commands, filesystem, users, ELF launch (disk-root, ISO-only, e1000) |
+| `tests/user_elf_smoke.py` | Ring-3 | ELF execution, `ps` visibility, user-mode I/O |
+| `tests/persistence_smoke.py` | Persistence | Write in boot 1, verify in boot 2 |
+| `tests/shell_cmd_test.c` | Unit | Shell command parser |
+| `tests/string_test.c` | Unit | String helper utilities |
+| `tests/fs_unit_test.c` | Unit | Filesystem mutation and path lookup |
+| `tests/xfs_unit_test.c` | Unit | K64XFS format, superblock, bitmaps, inodes |
+| `tests/kpm_unit_test.c` | Unit | KPM package manager validation |
+| `tests/klcs_unit_test.c` | Unit | KLCS errno mapping, path translation, FD reuse, syscall dispatch, trace logging, ELF validation |

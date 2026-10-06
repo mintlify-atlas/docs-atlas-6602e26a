@@ -1,0 +1,155 @@
+---
+title: "K64 Memory Management: PMM and VMM"
+sidebarTitle: "Memory"
+description: "K64 uses a bitmap-based physical memory manager (PMM) and a per-space virtual memory manager (VMM) that assigns isolated page-table roots to services and ELF processes."
+---
+
+K64's memory management is split across two subsystems with distinct responsibilities. The Physical Memory Manager (PMM) tracks which 4 KiB frames of physical RAM are in use and allocates or frees them. The Virtual Memory Manager (VMM) builds per-service and per-process page-table trees, assigns each one a private `CR3`, and maps ELF program segments and user pages into those isolated address spaces. Neither subsystem is meant to be general-purpose — both are sized and scoped to match what the K64 service/driver runtime actually needs today.
+
+## Physical Memory Manager (PMM)
+
+The PMM is initialized during step 8 of `k64_kernel_main()` by `k64_pmm_init()`. It reads the Multiboot memory map, builds a bitmap over all available physical frames, and marks reserved regions before any allocations are made.
+
+### What It Reserves
+
+The PMM marks the following regions as unavailable before returning:
+
+- The kernel image itself (as placed by the linker)
+- The Multiboot info structure passed in `EBX`
+- The copied memory-map buffer used to walk available RAM
+- Multiboot module descriptor records
+- The payload ranges of all Multiboot modules (e.g. `root.xfs`)
+
+Anything not reserved is available for general allocation. Frame size is fixed at 4 KiB.
+
+### API
+
+The full PMM interface from `k64_pmm.h`:
+
+```c
+void   k64_pmm_init(void);
+
+/* Allocate a single 4 KiB frame. Returns NULL on failure. */
+void*  k64_pmm_alloc_frame(void);
+
+/* Allocate 'frames' physically contiguous 4 KiB frames. Returns NULL on failure. */
+void*  k64_pmm_alloc_contiguous(size_t frames);
+
+/* Free a single 4 KiB frame. */
+void   k64_pmm_free_frame(void* frame);
+
+/* Free 'frames' contiguous 4 KiB frames starting at 'frame'. */
+void   k64_pmm_free_contiguous(void* frame, size_t frames);
+
+/* Query total and used frame counts. */
+size_t k64_pmm_total_frames(void);
+size_t k64_pmm_used_frames(void);
+```
+
+This is one of the more conventional pieces of the K64 codebase. The bitmap approach is simple, predictable, and sufficient for a kernel that does not need demand paging or copy-on-write.
+
+## Virtual Memory Manager (VMM)
+
+The VMM is initialized during step 9 of `k64_kernel_main()` by `k64_vmm_init()`. It provides real per-space page tables for services and ELF-backed executables, using PMM-allocated frames to back each new address space.
+
+### What It Does
+
+For each service or ELF process, the VMM:
+
+1. **Allocates a per-service VM slot** with a unique base address derived from that service's PID.
+2. **Assigns a root virtual range**, a heap window, and a stack window within the slot.
+3. **Clones the kernel bootstrap mapping** into a private `CR3` so kernel code remains accessible from the service's address space.
+4. **Maps a private stack** into the service space.
+5. **Executes service callbacks and command handlers** under the owning `CR3`, so each service runs with its own address-space root.
+6. **Maps ELF `PT_LOAD` segments** into temporary isolated executable spaces when loading `/ex/*.elf` or ELF-backed modules.
+7. **Maps `/ex/*.elf` images as user-accessible pages** for the ring-3 execution path, enabling `iretq`-based entry into user mode.
+8. **Provides a page-table lookup helper** (`k64_vmm_is_mapped`) used to reject unmapped user entry points before execution.
+
+### VMM API
+
+From `k64_vmm.h`:
+
+```c
+void k64_vmm_init(void);
+
+/* Allocate a service-mode (ring-0) VM space for the given PID. */
+bool k64_vmm_alloc_service_space(uint64_t pid, k64_vm_space_t* out_space);
+
+/* Allocate a user-mode (ring-3) VM space for the given PID. */
+bool k64_vmm_alloc_user_space(uint64_t pid, k64_vm_space_t* out_space);
+
+/* Release all frames and page tables belonging to a VM space. */
+void k64_vmm_release_service_space(k64_vm_space_t* space);
+
+/* Map a private (kernel-only) virtual range from raw bytes. */
+bool k64_vmm_map_private_range(k64_vm_space_t* space,
+                               uint64_t virt_addr,
+                               const uint8_t* data,
+                               size_t file_size,
+                               size_t mem_size);
+
+/* Map a user-accessible range from raw bytes (e.g. ELF PT_LOAD). */
+bool k64_vmm_map_user_range(k64_vm_space_t* space,
+                            uint64_t virt_addr,
+                            const uint8_t* data,
+                            size_t file_size,
+                            size_t mem_size);
+
+/* Map an anonymous (zero-filled) user-accessible range. */
+bool k64_vmm_map_user_anon(k64_vm_space_t* space, uint64_t virt_addr, size_t mem_size);
+
+/* Check whether a virtual address is mapped (optionally requiring user access). */
+bool k64_vmm_is_mapped(const k64_vm_space_t* space, uint64_t virt_addr, bool require_user);
+
+/* Copy bytes from a user virtual address into a kernel buffer. */
+bool k64_vmm_read_user(const k64_vm_space_t* space, uint64_t virt_addr, void* data, size_t size);
+
+/* Copy bytes from a kernel buffer into a user virtual address. */
+bool k64_vmm_write_user(const k64_vm_space_t* space, uint64_t virt_addr, const void* data, size_t size);
+
+/* Call a function in an isolated VM space. */
+uint64_t k64_vmm_call_isolated(const k64_vm_space_t* space,
+                               uint64_t entry,
+                               uint64_t arg0,
+                               uint64_t arg1,
+                               uint64_t arg2);
+```
+
+### VM Space Layout Constants
+
+Each service slot occupies a fixed window in the virtual address space. The constants in use today are:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| Base VM area | `0x0000000040000000` | Start of the per-service virtual address region |
+| Stride per slot | `0x01000000` (16 MiB) | Virtual address gap between adjacent service slots |
+| Root region size | `0x01000000` (16 MiB) | Maximum virtual range for the service's code/data |
+| Heap size | `0x00100000` (1 MiB) | Heap window per service slot |
+| Stack size | `0x00008000` (32 KiB) | Stack window per service slot |
+
+A service's VM base address is therefore `0x40000000 + (pid_index × 0x01000000)`. The `VM BASE` column in `servicectl list` reports this address for each registered service.
+
+### The `HOST` Column in `servicectl list`
+
+The `HOST` column reports the execution ring for each service:
+
+| Value | Meaning |
+|---|---|
+| `ring0` | Service executes in kernel mode (only the `kernel` service after v0.3.29) |
+| `ring3` | Service has passed Ring-3 verification and executes in user mode |
+| `blocked` | Service attempted startup but failed Ring-3 verification |
+
+<Info>
+After v0.3.29, only the literal `kernel` service identity runs at ring 0. All other services — including `fs`, `proc`, `io`, `sched`, `term`, `svc`, and all system/root/user services — must pass Ring-3 verification before their commands or service calls can dispatch. Silent startup without a valid Ring-3 image is rejected.
+</Info>
+
+### What the VMM Does Not Do
+
+The current VMM implementation has intentional limits:
+
+- **No copy-on-write**: each service gets a full physical copy of its mapped regions.
+- **No demand paging**: all pages are mapped at load time; there are no page-fault-driven allocation paths.
+- **Shared identity mapping remains**: the low identity-mapped kernel region is cloned into every service space rather than fully isolated. Full removal of the shared region is future work.
+- **No concurrent multi-process scheduling beyond synchronous ELF execution**: user process scheduling is cooperative-asynchronous rather than timer-preemptive.
+
+These limits are consistent with K64's current identity as an experimental kernel. The VMM is real and functional for the service/ELF runtime it supports, but it is not a general-purpose virtual memory system.

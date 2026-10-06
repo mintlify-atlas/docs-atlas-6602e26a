@@ -1,0 +1,142 @@
+---
+title: "K64XFS GRUB Module: Booting from a K64 Filesystem"
+sidebarTitle: "GRUB Module"
+description: "The k64xfs GRUB module lets GRUB mount K64XFS images, enumerate directories, and load grub.cfg and the kernel ELF directly from the root filesystem."
+---
+
+GRUB cannot read K64XFS natively, so K64 ships a custom GRUB filesystem module, `k64xfs.mod`, that teaches GRUB the on-disk layout of a K64XFS volume. Once loaded, GRUB can mount `root.xfs`, enumerate its directories, open arbitrary files, and read the "real" boot configuration stored inside the filesystem itself. This is what lets the default ISO boot path serve `grub.cfg` and the kernel ELF from the same `root.xfs` image that the running kernel later mounts as its root filesystem — there is no separate bootstrap-only file tree that has to be kept in sync.
+
+---
+
+## What the GRUB Module Does
+
+After `insmod k64xfs` runs in a GRUB config, GRUB gains the ability to:
+
+- **Mount a K64XFS image** — the module validates the superblock magic (`K64XFS1`), version, block size, and root inode before accepting a device as a K64XFS volume.
+- **Enumerate directories** — `grub_k64xfs_dir` walks the directory-entry blocks of any directory inode and reports each entry (name and directory/file type) to GRUB's `ls` and hook infrastructure.
+- **Open and read regular files** — `grub_k64xfs_open` resolves a path through the inode table and exposes the file size to GRUB; `grub_k64xfs_fsread` reads data by walking the inode's direct extents block-by-block.
+- **Load `/boot/grub/grub.cfg`** — the most important use: GRUB reads the "real" K64 menu config stored inside the K64XFS root filesystem rather than relying on a separate ISO-level config for every boot option.
+
+The module is implemented in **`grub/k64xfs.c`** and registers itself with GRUB's filesystem layer as `"k64xfs"` via `GRUB_MOD_INIT`/`GRUB_MOD_FINI`.
+
+---
+
+## Why the Module Exists
+
+Without `k64xfs.mod`, GRUB can only read filesystems it knows natively (ext2, FAT, ISO9660, and so on). The K64XFS format is custom, so without the module GRUB falls back to the ISO-level `grub.cfg` embedded in the ISO9660 tree — a static file that cannot know which kernel version is installed on the persistent disk.
+
+With the module loaded, GRUB can:
+
+1. Check the attached `root.disk` for a live `/boot/grub/grub.cfg` inside the K64XFS partition.
+2. Fall back to loop-mounting the ISO copy of `root.xfs` if no disk is present.
+3. Read the menu entries and kernel path from whichever source is available.
+
+This means the persistent disk is the authoritative source of boot configuration once K64 is installed, without any separate GRUB partition or EFI system partition.
+
+---
+
+## Build Process
+
+The GRUB module is built by the helper script `tools/build_grub_k64xfs.sh`. It compiles `grub/k64xfs.c` against GRUB's internal headers and links it as a GRUB module.
+
+```bash
+# Default build (GRUB source expected at /tmp/grub-src)
+tools/build_grub_k64xfs.sh
+
+# Override GRUB source path
+GRUB_SRC=/path/to/grub-src tools/build_grub_k64xfs.sh
+```
+
+The compiled module is written to:
+
+```text
+build/grub/i386-pc/k64xfs.mod
+```
+
+The main `Makefile` calls this script as part of the ISO creation flow. If you are building the GRUB module independently, make sure GRUB source headers are available at the path the script expects, or set `GRUB_SRC` to override it.
+
+<Note>
+`GRUB_SRC` defaults to `/tmp/grub-src`. If you have cloned the GRUB source tree elsewhere, set the environment variable before invoking the build script or running `make`.
+</Note>
+
+---
+
+## How GRUB Loads the Module
+
+The ISO bootstrap config (`iso/boot/grub/grub.cfg`, generated from `build/grub-bootstrap.cfg`) loads the module with:
+
+```text
+insmod k64xfs
+```
+
+After that line, GRUB can use `k64xfs`-formatted devices in subsequent `set root`, `search`, and `loopback` commands. The typical bootstrap flow loop-mounts `root.xfs` from the ISO and then reads `/boot/grub/grub.cfg` from inside it:
+
+```text
+insmod k64xfs
+set k64_iso_root=$root
+loopback loop ($k64_iso_root)/boot/root.xfs
+set root=(loop)
+configfile /boot/grub/grub.cfg
+```
+
+When a writable K64 disk is attached, GRUB uses `search` to find the K64XFS partition on the disk instead of the loop device, so the installed grub.cfg is used instead of the ISO copy.
+
+---
+
+## The Two GRUB Config Files
+
+K64 maintains two distinct GRUB config files with different roles.
+
+<CardGroup cols={2}>
+  <Card title="ISO bootstrap config" icon="compact-disc">
+    **Source:** `build/grub-bootstrap.cfg`  
+    **Installed at:** `iso/boot/grub/grub.cfg`
+
+    This is the first config GRUB reads when booting from the ISO. Its responsibilities are:
+    - Load `insmod k64xfs`
+    - Save the ISO root as `k64_iso_root`
+    - Offer **Try K64 live** (passes `boot_mode=live`)
+    - Offer **Install K64** (passes `boot_mode=installer`)
+    - Boot the kernel from the ISO and pass `root.xfs` as a Multiboot module for the fallback path
+  </Card>
+  <Card title="Rootfs GRUB config" icon="hard-drive">
+    **Source:** `build/grub-root.cfg`  
+    **Installed at:** `/boot/grub/grub.cfg` inside the K64XFS volume
+
+    This is the "real" config that lives inside the root filesystem. It contains the actual kernel load command:
+
+    ```text
+    multiboot /boot/k64-kernel-v<version>.elf \
+      pit_hz=1000 log_level=debug
+    ```
+
+    When GRUB mounts the K64XFS volume and reads this file, the kernel version and boot parameters are always in sync with what was staged into the rootfs during the last build.
+  </Card>
+</CardGroup>
+
+---
+
+## GRUB Module Internals
+
+The module implements the four callbacks in GRUB's `grub_fs` interface:
+
+| Callback | Function | Description |
+|---|---|---|
+| `fs_dir` | `grub_k64xfs_dir` | Resolves a path to a directory inode, then iterates its dirent blocks and calls the GRUB dir hook for each valid entry |
+| `fs_open` | `grub_k64xfs_open` | Resolves a path to a regular-file inode, allocates a `grub_k64xfs_file` context, and sets `file->size` |
+| `fs_read` | `grub_k64xfs_fsread` | Reads `len` bytes from the file by mapping the byte offset to a logical block, walking direct extents, and copying from a 4096-byte static block buffer |
+| `fs_close` | `grub_k64xfs_close` | Frees the mount and file context allocated during `fs_open` |
+
+The module keeps a single static 4096-byte buffer (`grub_k64xfs_block_buf`) for block reads. This is safe because GRUB is single-threaded at the point it reads the filesystem.
+
+Path resolution in the module supports absolute paths with `/` separators and handles the `"."` component. The `".."` component is explicitly unsupported and returns `GRUB_ERR_FILE_NOT_FOUND` — K64XFS directories do not store parent-inode back-links in the GRUB module's read path.
+
+---
+
+## ISO-Only Boot Without `root.disk`
+
+<Note>
+If you boot the K64 ISO in a VM without attaching `build/root.disk`, the kernel uses the Multiboot `root.xfs` module passed from the ISO bootstrap config. The filesystem mounts in memory from that image. All shell commands, `xfsctl` operations, and `/ex/*.elf` programs work normally, but any changes you make are ephemeral — they are not written to any persistent block device and are lost when the system shuts down.
+
+To get persistent storage, attach `build/root.disk` as a secondary IDE disk before booting, or use `install <device> yes` to write K64 to a dedicated disk from within a running session.
+</Note>

@@ -1,0 +1,229 @@
+---
+title: "Building K64 from Source"
+sidebarTitle: "Building"
+description: "Toolchain requirements, Makefile targets, compiler flags, rootfs staging flow, ISO creation, and QEMU run options for building K64."
+---
+
+K64 is built entirely from a single `Makefile`. It produces a bootable ISO (`k64.iso`), a persistent disk image (`build/root.disk`), and all the binary `.k64s` service and `.k64m` driver modules that end up inside the root filesystem. This page documents the toolchain requirements, every important compiler flag, the rootfs staging pipeline, the ISO creation flow, and all configurable environment variables.
+
+## Toolchain Detection
+
+The Makefile probes for cross-compilers first and falls back to whatever is available on the host:
+
+| Variable | Preferred | Fallback |
+|---|---|---|
+| `CC64` | `x86_64-elf-gcc` | host `gcc` (or `clang` if found) |
+| `CC32` | `i686-elf-gcc` | same as `CC64` |
+| `LD` | `x86_64-elf-ld` | host `ld` (or `ld.lld` if found) |
+
+Clang is also supported. When `clang` is detected and no dedicated cross GCC is present, the build sets `CC64 := clang` and passes `--target=x86_64-elf` automatically. LLD (`ld.lld`) is preferred over host `ld` when both are present.
+
+If no suitable 64-bit compiler is found at all, the Makefile aborts with an explicit error.
+
+<Note>
+  For the cleanest freestanding kernel build, install a bare-metal cross-compiler such as `x86_64-elf-gcc` and `x86_64-elf-ld`. Building with the host `gcc` works but requires that your host GCC supports 64-bit freestanding targets.
+</Note>
+
+## Compiler Flags
+
+### Kernel flags — `CFLAGS64`
+
+All kernel and boot sources are compiled with:
+
+```text
+-m64 -ffreestanding -O2 -Wall -Wextra
+-fno-stack-protector -fno-builtin -fno-pic -fno-pie
+-mno-red-zone -mcmodel=kernel -mgeneral-regs-only
+-mno-mmx -mno-sse -mno-sse2
+```
+
+Each flag has a specific reason:
+
+| Flag | Why it is used |
+|---|---|
+| `-ffreestanding` | No host libc or startup code; the kernel provides its own runtime |
+| `-fno-stack-protector` | No `__stack_chk_guard` symbol or stack-canary writes in kernel code |
+| `-fno-pic` / `-fno-pie` | Kernel code uses absolute addressing; position-independent relocations are incompatible with `mcmodel=kernel` |
+| `-mno-red-zone` | The x86-64 System V ABI red zone (128 bytes below `rsp`) is unsafe in kernel interrupt handlers — an IRQ could corrupt it |
+| `-mcmodel=kernel` | Tells GCC that the kernel image is linked in the upper 2 GiB of the virtual address space; generates correct RIP-relative and absolute references |
+| `-mgeneral-regs-only` | Restricts code generation to integer registers; prevents the compiler from using SSE/AVX registers in kernel context |
+| `-mno-mmx` / `-mno-sse` / `-mno-sse2` | SSE is **intentionally disabled** in all kernel builds. SSE registers are not saved and restored on every context switch (that would be expensive), so the kernel must never accidentally use them. Disabling SSE at compile time guarantees no SSE instructions appear in kernel code. |
+
+### Userland flags — `USER_CFLAGS`
+
+Userland programs in `userland/bin/` and ELF samples in `ex/` use a slightly relaxed set:
+
+```text
+-m64 -ffreestanding -O2 -Wall -Wextra
+-fno-stack-protector -fno-builtin -fno-pic -fno-pie
+-mno-red-zone -mno-mmx -mno-sse -mno-sse2
+```
+
+`-mcmodel=kernel` and `-mgeneral-regs-only` are omitted because userland ELFs are linked at `0x40000000` (user virtual address space), not the kernel high-memory model.
+
+## Makefile Targets
+
+| Target | What it does |
+|---|---|
+| `make` | Builds `k64.iso` (the default target) |
+| `make run` | Boots `k64.iso` in QEMU with serial output on stdio and `build/root.disk` attached as an IDE drive |
+| `make run-headless` | Same as `make run` but passes `-nographic` to QEMU; all output goes through the terminal |
+| `make test` | Builds the ISO and runs the full test suite: host unit tests, GRUB config check, boot smoke, disk boot smoke, install smoke, shell smoke (disk mode, ISO-only mode, e1000 mode), user ELF smoke, and persistence smoke |
+| `make clean` | Removes all generated artifacts: object files, kernel ELF, `iso/`, `build/`, `k64.iso`, test binaries |
+| `make iso` | Builds both `k64.iso` and `k64-extra.iso` (the extra ISO includes KLCS-staged Linux compatibility apps) |
+
+<Tip>
+  Use `make run-headless` when working in a terminal-only environment such as WSL or a remote SSH session. All VGA text output and serial output are routed to your terminal via `-nographic`.
+</Tip>
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `K64_DISK_SIZE` | `32M` | Size of the generated `build/root.disk` persistent disk image. The MBR partition entry is updated to match. |
+| `ROOTFS_IMAGE_SIZE` | `16M` | Size of the K64XFS root filesystem image (`build/root.xfs`). Must be large enough to hold all staged rootfs content. |
+| `ROOTFS_EXTRA_IMAGE_SIZE` | `128M` | Size of the larger `build/root-extra.xfs` image used for `k64-extra.iso`, which includes KLCS-staged Linux apps. |
+| `GRUB_SRC` | `/tmp/grub-src` | Path to GRUB source headers required to compile `grub/k64xfs.c` into `k64xfs.mod`. Override if your GRUB source tree is elsewhere. |
+| `QEMU` | `qemu-system-x86_64` | QEMU binary to use for `make run` and `make run-headless`. |
+| `PYTHON` | `python3` | Python interpreter used for build tools. |
+
+Example — build with a 128 MiB persistent disk:
+
+```bash
+K64_DISK_SIZE=128M make k64.iso
+```
+
+## Versioning
+
+K64 splits versioning into two parts:
+
+- **Major and minor** are controlled manually in `k64_version.h`:
+
+  ```c
+  #define K64_VERSION_MAJOR            0
+  #define K64_VERSION_MINOR            3
+  #define K64_VERSION_PATCH_BASE_COUNT 13
+  ```
+
+- **Patch** is computed automatically by `tools/gen_k64_version.py`:
+
+  ```
+  patch = git rev-list --count HEAD -- <tracked-kernel-paths>
+        - K64_VERSION_PATCH_BASE_COUNT
+        + 1  (when the working tree is dirty)
+  ```
+
+The tracked scope covers top-level kernel and boot sources (`*.c`, `*.h`, `*.s`, `*.S`), `linker.ld`, `k64m/`, `k64s/`, `ex/`, `grub/`, and `rootfs/`. Changes limited to `.github/`, tests, or tooling do not bump the patch version. `k64_version.h` itself is explicitly excluded so release-baseline edits do not count as kernel changes.
+
+The full version string is written to `build/k64_autoversion.h` and propagated automatically to the kernel ELF name (`k64-kernel-v<version>.elf`), the staged `/boot` directory, the GRUB rootfs config, `sysfetch`, and `uname`.
+
+## Rootfs Staging Flow
+
+The rootfs staging step assembles the source tree and all generated artifacts into `build/rootfs/` before the K64XFS image is created. The steps are:
+
+<Steps>
+  <Step title="Copy rootfs/ into build/rootfs/">
+    The `rsync` step copies the source-controlled `rootfs/` tree into `build/rootfs/`, excluding any desktop-environment artifacts.
+  </Step>
+  <Step title="Create system directories">
+    The build creates `build/rootfs/boot`, `build/rootfs/boot/grub`, `build/rootfs/k64s`, `build/rootfs/k64m`, `build/rootfs/ex`, and `build/rootfs/compat/linux/bin` if they do not already exist.
+  </Step>
+  <Step title="Copy the versioned kernel ELF">
+    The versioned kernel image is copied to `build/rootfs/boot/k64-kernel-v<version>.elf`.
+  </Step>
+  <Step title="Copy the generated grub.cfg">
+    `build/grub-root.cfg` is copied to `build/rootfs/boot/grub/grub.cfg`. This is the GRUB config that the kernel reads from the persistent disk root after mount. Its default menu entry is:
+
+    ```text
+    multiboot /boot/k64-kernel-v<version>.elf pit_hz=1000 log_level=debug
+    ```
+  </Step>
+  <Step title="Compile k64s_def/*.svc into binary .k64s files">
+    `tools/build_k64x.py` reads each `.svc` source definition and writes a packed binary `.k64s` file containing the `K64S` magic, artifact version, execution kind (`builtin` or `elf`), service class, flags (`autostart`, `async`), priority, poll interval, name, and optional ELF entry path.
+  </Step>
+  <Step title="Compile k64m_def/*.drv into binary .k64m files">
+    The same tool reads each `.drv` source definition and writes a packed binary `.k64m` file containing the `K64M` magic, artifact version, execution kind, module type, flags, priority, name, and optional ELF entry path.
+  </Step>
+  <Step title="Copy compiled binary modules into staged rootfs">
+    All `.k64s` binaries are copied to `build/rootfs/k64s/` and all `.k64m` binaries to `build/rootfs/k64m/`. Assembly ELF samples and C userland ELFs are copied to `build/rootfs/ex/`.
+  </Step>
+  <Step title="Run tools/mk_k64xfs.py to create build/root.xfs">
+    The Python image builder walks `build/rootfs/`, allocates inodes and data blocks, writes the K64XFS superblock, inode bitmap, block bitmap, journal skeleton, inode table, and directory/file data into `build/root.xfs` at the size specified by `ROOTFS_IMAGE_SIZE`.
+  </Step>
+</Steps>
+
+## ISO Creation Flow
+
+Once the rootfs image and kernel ELF are ready, the ISO build proceeds as follows:
+
+<Steps>
+  <Step title="Build the kernel ELF">
+    All kernel `.c` and `.S` sources are compiled with `CFLAGS64` and linked via `linker.ld` into `k64-kernel-v<version>.elf`. The Makefile verifies the result is a valid Multiboot image with `grub-file --is-x86-multiboot` when `grub-file` is available.
+  </Step>
+  <Step title="Build grub/k64xfs.c into k64xfs.mod">
+    `tools/build_grub_k64xfs.sh` compiles the custom GRUB filesystem module from `grub/k64xfs.c` against the GRUB source headers (located at `GRUB_SRC`, default `/tmp/grub-src`) and installs the resulting `k64xfs.mod` into `build/grub/i386-pc/`.
+
+    <Warning>
+      This step requires the GRUB source header tree. If `GRUB_SRC` is not set and `/tmp/grub-src` does not exist, the GRUB module build will fail. Download or extract the GRUB source matching your installed `grub2-tools` version and point `GRUB_SRC` at it.
+    </Warning>
+  </Step>
+  <Step title="Generate bootstrap and root GRUB configs">
+    Two GRUB config files are generated:
+    - `build/grub-bootstrap.cfg` — installed as `iso/boot/grub/grub.cfg`; offers **Try K64 live** (`boot_mode=live`) and **Install K64** (`boot_mode=installer`) menu entries.
+    - `build/grub-root.cfg` — staged into `build/rootfs/boot/grub/grub.cfg`; contains the silent single-entry rootfs boot.
+  </Step>
+  <Step title="Build build/root.xfs">
+    The K64XFS rootfs image is created from the staged `build/rootfs/` tree as described in the rootfs staging flow above.
+  </Step>
+  <Step title="Create build/root.disk">
+    A raw disk image is created at `K64_DISK_SIZE`:
+
+    ```bash
+    truncate -s 32M build/root.disk
+    dd if=build/k64-boot-area.bin of=build/root.disk conv=notrunc
+    dd if=build/root.xfs of=build/root.disk bs=512 seek=2048 conv=notrunc
+    ```
+
+    The BIOS boot area (built by `tools/mk_k64_boot_area.py` using `grub-mkimage`) is written at LBA 0; the K64XFS root filesystem is written at LBA 2048. This layout allows `build/root.disk` to be used as a standalone bootable disk in BIOS/legacy mode without the ISO.
+  </Step>
+  <Step title="Assemble the iso/ tree and run grub-mkrescue">
+    The kernel ELF is copied to `iso/boot/`, `build/root.xfs` is copied to `iso/root.xfs`, and `build/grub-bootstrap.cfg` is copied to `iso/boot/grub/grub.cfg`. Then:
+
+    ```bash
+    grub-mkrescue -d build/grub/i386-pc -o k64.iso iso/
+    ```
+
+    This embeds the `k64xfs.mod` GRUB module directory and produces the final `k64.iso`.
+  </Step>
+</Steps>
+
+## QEMU Run Flags
+
+`make run` expands to:
+
+```bash
+qemu-system-x86_64 \
+  -boot order=d \
+  -cdrom k64.iso \
+  -drive file=build/root.disk,format=raw,if=ide,index=0 \
+  -netdev user,id=k64net \
+  -device rtl8139,netdev=k64net \
+  -serial stdio \
+  -no-reboot \
+  -no-shutdown
+```
+
+`make run-headless` substitutes `-nographic` for `-serial stdio`.
+
+The default QEMU setup attaches an RTL8139 NIC. To test the e1000 driver path (as used in the e1000 smoke test), pass the device explicitly:
+
+```bash
+qemu-system-x86_64 \
+  -boot order=d -cdrom k64.iso \
+  -drive file=build/root.disk,format=raw,if=ide,index=0 \
+  -netdev user,id=k64net \
+  -device e1000,netdev=k64net \
+  -serial stdio -no-reboot -no-shutdown
+```
+
+For VMware, configure the virtual NIC as **Intel E1000** to use the `e1000.k64m` driver path.

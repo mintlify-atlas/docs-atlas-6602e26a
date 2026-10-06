@@ -1,0 +1,147 @@
+---
+title: "K64 Boot Pipeline: GRUB to Kernel Main"
+sidebarTitle: "Boot"
+description: "Step-by-step boot path from GRUB Multiboot through 32-bit setup, page table construction, long-mode switch, and kernel initialization in k64_kernel_main."
+---
+
+K64 boots as a Multiboot v1 payload under GRUB, but the full path from power-on to a running shell is more involved than "GRUB loads kernel directly." There is a two-stage GRUB configuration, a filesystem mount decision, and a deliberate sequence of low-level assembly steps before `k64_kernel_main()` can run. This page walks the entire path in order.
+
+## Step 1: ISO Bootstrap Config
+
+The ISO-root GRUB configuration is generated into `build/grub-bootstrap.cfg` and installed as `iso/boot/grub/grub.cfg`. Its job is to prepare the GRUB environment before handing off to the rootfs-resident configuration.
+
+What the bootstrap config does:
+
+- Loads the custom GRUB `k64xfs` module so GRUB can read `K64XFS` images directly.
+- Remembers the ISO root device as `k64_iso_root`.
+- Offers two menu entries:
+
+| Entry | Kernel Argument | Effect |
+|---|---|---|
+| **Try K64 live** | `boot_mode=live` | Boots into a live session; writable disk mounted if available. |
+| **Install K64** | `boot_mode=installer` | Opens the K64 text installer guide after boot. |
+
+In both cases, the bootstrap config passes `root.xfs` directly as a Multiboot module. If a writable K64 disk is attached, the kernel mounts that disk as the persistent root after startup.
+
+## Step 2: Rootfs GRUB Config
+
+The "real" GRUB configuration is generated into `build/grub-root.cfg` and copied into the staged rootfs as `/boot/grub/grub.cfg`. GRUB reads this file from the K64XFS image — either on the attached disk or from the loop-mounted ISO copy of `root.xfs`.
+
+The default menu entry is:
+
+```text
+multiboot /boot/k64-kernel-v<version>.elf pit_hz=1000 log_level=debug
+```
+
+The three recognized command-line keys are:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `pit_hz` | `1000` | PIT timer frequency in Hz |
+| `log_level` | `debug` | Kernel log verbosity |
+| `boot_mode` | `live` | `live` or `installer` |
+
+This config drives two distinct boot modes:
+
+- **Persistent disk-root mode**: GRUB boots from `build/root.disk`. The `fs.k64m` driver mounts the K64XFS partition on the ATA disk (`ata0p1`). Writes survive reboot.
+- **ISO fallback mode**: GRUB passes `root.xfs` as a Multiboot module. The kernel mounts that image in memory. No persistence across reboots.
+
+## Step 3: Kernel-Side Mount
+
+`k64_fs_driver_start()` (the `fs` built-in driver) mounts the root filesystem in strict priority order:
+
+<Steps>
+  <Step title="Block-device K64XFS">
+    Scan registered block devices for a valid `K64XFS` header. Accepts raw K64XFS at LBA 0 (older disk images) or an installed K64XFS partition starting at LBA 2048 (behind the BIOS boot area). In the default QEMU build, `ata0p1` is found here.
+  </Step>
+  <Step title="Multiboot module root.xfs">
+    If no block-backed root is found, scan Multiboot modules for one whose path ends in `.xfs`. Normally this is `root.xfs` passed from the ISO bootstrap config.
+  </Step>
+  <Step title="In-memory fallback tree">
+    If neither of the above succeeds, mount a tiny in-memory fallback tree so the kernel has a minimal filesystem surface during early bring-up.
+  </Step>
+</Steps>
+
+After the root is mounted, the native loaders for `.k64s` and `.k64m` files discover their binaries under `/k64s` and `/k64m` respectively.
+
+## Low-Level Boot Path
+
+The machine-level path from GRUB handoff to `k64_kernel_main()` is handled entirely by two assembly files: `boot.s` (32-bit) and `longmode.s` (64-bit entry stub).
+
+<Steps>
+  <Step title="GRUB loads kernel image and Multiboot modules">
+    GRUB reads the kernel ELF from `/boot/k64-kernel-v<version>.elf`, places it in memory, and optionally loads `root.xfs` as a Multiboot module. GRUB then jumps to the `_start` symbol in `boot.s` with `EAX = 0x2BADB002` (Multiboot magic) and `EBX` pointing to the Multiboot info structure.
+  </Step>
+  <Step title="boot.s runs in 32-bit mode, saves Multiboot values">
+    The entry point immediately calls `cli` to disable interrupts, then saves `EAX` and `EBX` into the BSS variables `k64_mb_magic` and `k64_mb_info`:
+
+    ```c
+    mov %eax, k64_mb_magic
+    mov %ebx, k64_mb_info
+    ```
+
+    These values are used later by `k64_kernel_main()` for Multiboot validation and module enumeration.
+  </Step>
+  <Step title="boot.s sets up the temporary 32-bit stack">
+    The stack pointer is set to `stack_top`, the top of a 4096-byte BSS region defined in `boot.s`:
+
+    ```c
+    mov $stack_top, %esp
+    ```
+
+    A GDT that includes 64-bit code, data, user data, user code, and TSS descriptors is loaded at this point with `lgdt gdt64_descriptor`.
+  </Step>
+  <Step title="boot.s builds minimal page tables">
+    `setup_paging` constructs the smallest page-table structure that long mode requires:
+
+    - **PML4**: one entry pointing to the PDPT, with Present and Read/Write bits set (`0x003`).
+    - **PDPT**: entry 0 maps the first 1 GiB as a single large page, with Present, Read/Write, and Page Size bits set (`0x083`).
+
+    This is a flat identity map — virtual address 0 maps to physical address 0, covering the entire first gigabyte. The kernel image, stack, and Multiboot structures all fall within this window.
+  </Step>
+  <Step title="boot.s enables PAE, long mode, loads CR3, enables paging, far-jumps to 64-bit code">
+    Four CPU control operations complete the mode switch:
+
+    ```c
+    /* 1. Enable PAE in CR4 */
+    mov %cr4, %eax
+    or  $(1 << 5), %eax   /* PAE bit */
+    mov %eax, %cr4
+
+    /* 2. Enable long mode in EFER (MSR 0xC0000080) */
+    mov $0xC0000080, %ecx
+    rdmsr
+    or  $(1 << 8), %eax   /* LME bit */
+    wrmsr
+
+    /* 3. Point CR3 at the PML4 table */
+    mov $pml4_table, %eax
+    mov %eax, %cr3
+
+    /* 4. Enable paging and protected mode in CR0, far-jump to 64-bit segment */
+    mov %cr0, %eax
+    or  $0x80000001, %eax
+    mov %eax, %cr0
+    ljmp $0x08, $long_mode_entry
+    ```
+
+    The far jump (`ljmp`) reloads `CS` with selector `0x08` (the 64-bit code descriptor from the GDT) and jumps to `long_mode_entry` in `longmode.s`. The CPU is now in 64-bit long mode.
+  </Step>
+  <Step title="longmode.s sets up segment registers, switches to the 64-bit stack, calls k64_kernel_main()">
+    `longmode.s` loads the 64-bit data segment selectors into `DS`, `ES`, `FS`, `GS`, and `SS`, switches the stack pointer to the permanent kernel stack region defined in the linker script, then calls `k64_kernel_main()`. The kernel C runtime begins here.
+  </Step>
+</Steps>
+
+<Note>
+The page-table setup in `boot.s` is deliberately minimal — it is only sufficient to enter long mode and run the kernel image within the first gigabyte. `k64_vmm_init()` and subsequent VMM calls add private page-table roots for each service and for ELF executables, including isolated ring-3 address spaces for `/ex/*.elf` programs. The identity mapping is intentionally shared between the bootstrap environment and early kernel execution.
+</Note>
+
+## Boot Modes Summary
+
+| Mode | Root Source | Persistence | Triggered By |
+|---|---|---|---|
+| **Persistent disk-root** | K64XFS on `ata0p1` (`build/root.disk`) | Yes — writes survive reboot | GRUB reads rootfs `grub.cfg` from disk |
+| **ISO fallback** | `root.xfs` Multiboot module from ISO | No — in-memory only | No valid K64XFS disk found |
+| **In-memory fallback** | Tiny built-in tree | No | Neither disk nor `.xfs` module present |
+
+In the default QEMU build, `make` creates and attaches `build/root.disk` as an IDE hard disk alongside the ISO. The CD is the boot medium; the disk is the persistent root. Both are present, so the persistent disk-root path is used.

@@ -1,0 +1,279 @@
+---
+title: "K64 Service Command Reference: servicectl, driverctl, netctl, and More"
+sidebarTitle: "Service Commands"
+description: "Reference for all K64 service-registered shell commands: servicectl, driverctl, storagectl, netctl, userctl, kpm, reload, sysfetch, uname, k64cc, elfrun, klcs, and fsctl."
+---
+
+Service commands are not hard-coded into the shell. Each one is registered by a running service through `k64_system_register_command()` and dispatched from the shell via `k64_system_dispatch_command()`. When you type a command that is not a shell built-in, the shell asks the service registry whether any running service owns that name and, if so, calls its handler directly. The sections below document every command surface exposed by the built-in services, organized by owning service.
+
+---
+
+## `servicectl` — Service Management
+
+The `servicectl` service provides runtime control over the K64 service registry. It is registered as a system-class service and starts automatically via `init`.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `servicectl list` | Print all registered services |
+| `servicectl list stopped` | Print only stopped services |
+| `servicectl stopped` | Alias for `servicectl list stopped` |
+| `servicectl start <pid>` | Start the service with the given PID |
+| `servicectl stop <pid>` | Stop the service with the given PID |
+| `servicectl restart <pid>` | Stop then start the service with the given PID |
+
+### List View Columns
+
+| Column | Description |
+|---|---|
+| PID | Numeric service PID (kernel=0, system=1000+, root=2000+, user=3000+) |
+| State | `running` or `stopped` |
+| Class | Service class: `kernel`, `system`, `root`, or `user` |
+| Name | Registered service name |
+| VM Base | Base virtual address of the service's isolated VM window |
+
+<Note>
+Non-root users can only start and stop user-class services (PID 3000+). Managing system or root-class services requires effective root or sudo elevation.
+</Note>
+
+---
+
+## `driverctl` — Driver Management
+
+The `driverctl` service provides runtime control over the K64 driver registry. Driver IDs start at `4000`.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `driverctl list` | Print all registered drivers |
+| `driverctl list stopped` | Print only stopped drivers |
+| `driverctl stopped` | Alias for `driverctl list stopped` |
+| `driverctl start <id>` | Start the driver with the given ID |
+| `driverctl stop <id>` | Stop the driver with the given ID |
+| `driverctl restart <id>` | Stop then start the driver with the given ID |
+
+### List View Columns
+
+| Column | Description |
+|---|---|
+| Driver ID | Numeric driver ID (starts at 4000) |
+| State | `running` or `stopped` |
+| Name | Registered driver name (e.g. `screen`, `keyboard`, `fs`, `ata`, `rtl8139`) |
+| Source | Path to the binary source used to register the driver (e.g. `/k64m/ata.k64m`) |
+
+<Warning>
+Driver management is root-only. Attempting to start, stop, or restart a driver without effective root will be rejected.
+</Warning>
+
+---
+
+## `storagectl` — Block Device and Storage Control
+
+The `storagectl` service exposes the ATA block layer and K64XFS volume state.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `storagectl list` | List registered block devices with mode, geometry, and human-readable size |
+| `storagectl partitions <device>` | Read the MBR and report partition sizes and unallocated space |
+| `storagectl partition <device> k64 yes` | Write a single-partition K64 MBR layout (confirmation-gated) |
+| `storagectl root` | Report the mounted rootfs source, used/free/total K64XFS volume capacity |
+| `storagectl sync` | Flush the mounted K64XFS image back to the block device |
+| `grow /` | Refresh the mounted K64XFS root volume capacity from the backing partition |
+| `install` | Print installer guidance and list writable target disks |
+| `install <device> yes` | Write the GRUB boot area and K64XFS root to the named disk (confirmation-gated) |
+| `sync` | Global filesystem flush; also available as a shell built-in pass-through |
+
+<Warning>
+`storagectl partition <device> k64 yes` and `install <device> yes` overwrite the target disk's partition table and boot area respectively. These operations are intentionally confirmation-gated.
+</Warning>
+
+---
+
+## `netctl` — Network Control
+
+The `netctl` service exposes the Ethernet/IP network stack built on the RTL8139 and e1000 drivers.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `netctl status` | Print NIC identity, MAC address, and current IP configuration |
+| `netctl poll` | Poll the receive ring for incoming Ethernet frames |
+| `netctl dhcp` | Send a DHCP discover/request and apply the received lease |
+| `netctl resolve <host>` | Resolve a hostname via DNS and print the result |
+| `netctl arp <ipv4>` | Send an ARP request for the given IPv4 address |
+| `ping <ipv4\|host>` | Send ICMP echo requests and report replies |
+| `kcurl http://host[:port]/path` | Fetch a plain HTTP/1.0 resource and print the response body |
+| `udp send <ipv4> <port> <text>` | Send a UDP datagram to the given address and port |
+
+<Note>
+`https://` URLs are intentionally rejected by `kcurl` until K64 has TLS support. Only `http://` sources are accepted by both `kcurl` and `kpm`.
+</Note>
+
+---
+
+## `userctl` — User, Session, and Privilege Management
+
+The `userctl` service implements the user and privilege model. It reads and writes `/etc/users.k64` and `/etc/groups.k64`.
+
+### Account and Session Commands
+
+| Command | Description |
+|---|---|
+| `users` | List all accounts with role, primary group, and session state |
+| `groups [user]` | List all groups, or the groups for a specific user |
+| `whoami` | Print the current effective username |
+| `id` | Show real user, effective user, primary group, supplemental groups, and home |
+| `login <user> <password>` | Authenticate and switch to the named account |
+| `logout` | End the current session and return to the login gate |
+| `su <user>` | Switch to a different user account |
+| `sudo` / `sudo on` | Enable effective root for the current session (sudo-capable users only) |
+| `sudo <password>` | Password-checked form of sudo elevation |
+| `sudo off` | Drop effective root |
+| `passwd <user> <newpass>` | Change a user's password |
+
+### Account Administration Commands (root only)
+
+| Command | Description |
+|---|---|
+| `useradd <user> <password> [user\|sudo\|root] [group]` | Create a new account |
+| `userdel <user>` | Delete a non-root account |
+| `usermod role <user> <user\|sudo\|root>` | Change a user's role |
+| `usermod primary <user> <group>` | Change a user's primary group |
+| `usermod groupadd <user> <group>` | Add a user to a supplemental group |
+| `usermod groupdel <user> <group>` | Remove a user from a supplemental group |
+| `groupadd <group>` | Create a new group |
+| `groupdel <group>` | Delete a group (only if not essential and not a primary group) |
+| `gpasswd add <group> <user>` | Add a user to a group |
+| `gpasswd del <group> <user>` | Remove a user from a group |
+
+---
+
+## `kpm` — Package Manager Client
+
+The `kpm` service is the K64 Package Manager client. It consumes a static HTTP package source; K64 does not host the repository server itself.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `kpm source add <name> <url>` | Register a package source base URL |
+| `kpm source del <name>` | Remove a package source |
+| `kpm source list` / `kpm sources` | List configured package sources |
+| `kpm list` | List available packages from all configured sources |
+| `kpm versions <package>` | Show available versions of a package |
+| `kpm install <package>` | Download and install the latest version of a package |
+| `kpm install <package> -v <version>` | Install a specific version |
+
+Package state lives in `/etc/kpm/sources.cfg` (source list), `/var/lib/kpm/installed.db` (installed packages), and `/tmp/kpm/` (download staging area).
+
+---
+
+## `reload` — Runtime Reload
+
+The `reload` service handles runtime reload requests for drivers and the kernel image.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `reload drivers` | Stop all controllable running drivers, rescan `/k64m` from the mounted rootfs, and re-bootstrap autostart drivers |
+| `reload kernel` | Experimental hot-reload handoff into a new kernel image; the handoff path exists but does not currently complete successfully |
+
+<Warning>
+`reload kernel` is incomplete. The request and trampoline paths exist in the source tree (`k64_hotreload.c`, `k64_hotreload.S`) but the new kernel does not successfully come back up after handoff. Treat it as experimental.
+</Warning>
+
+---
+
+## `sysfetch` — System Information
+
+The `sysfetch` service displays a formatted summary of the running system: kernel version, architecture, uptime in ticks, memory stats, mounted root source, active driver and service counts, and network identity. No sub-commands; just run:
+
+```text
+sysfetch
+```
+
+---
+
+## `uname` — Kernel Identity
+
+The `uname` service prints the kernel name, version string, and architecture. The version string is auto-generated from `k64_version.h` (major and minor) and `build/k64_autoversion.h` (patch, computed by `tools/gen_k64_version.py`).
+
+```text
+uname
+```
+
+**Example output:**
+
+```text
+K64 v0.3.37 x86_64
+```
+
+---
+
+## `k64cc` — In-System Builder
+
+The `k64cc` service provides an in-kernel scaffold builder for simple K64 module artifacts without needing a host build environment.
+
+```text
+k64cc
+```
+
+`k64cc` can generate simple ELF entry stubs and binary K64 module scaffolds (`.k64s` / `.k64m` metadata) directly from the running system. It is intended for quick prototyping and does not replace the full host-side build pipeline (`python3 tools/build_k64x.py`).
+
+---
+
+## `elfrun` / `elfctl` — ELF Execution
+
+The `elfctl` service registers the `elfrun` command, which triggers explicit ELF execution through the kernel ELF loader.
+
+```text
+elfrun <path>
+```
+
+`elfrun /ex/hello.elf` is equivalent to typing `hello` at the shell (after the name falls through the dispatch chain to the path resolver). The explicit form is useful when you want to run an ELF that does not have a matching name in the path config, or when you want to bypass ambiguity with a service or driver of the same name.
+
+**Example:**
+
+```text
+elfrun /ex/libctest.elf
+elfrun /ex/args.elf alpha beta
+```
+
+---
+
+## `klcs` — K64 Linux Compatibility Service
+
+The `klcs` service (K64 Linux Compatibility Service) provides a compatibility path for selected Linux x86_64 userspace behavior, routing it into native K64 service calls. It adds a real x86_64 `syscall` entry gate for Linux-personality ring-3 processes.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `klcs status` | Print KLCS state: whether it is active, which compatibility paths are mounted |
+| `klcs syscalls` | List the Linux syscall numbers that KLCS currently handles |
+| `klcs trace on` | Enable syscall tracing for Linux-personality processes |
+| `klcs trace off` | Disable syscall tracing |
+| `klcs trace dump` | Print the accumulated syscall trace log |
+| `klcs run <path> [args]` | Explicitly launch a Linux ELF through the KLCS loader |
+
+### PATH Integration
+
+When KLCS is installed, staged Linux ELF binaries in `/compat/linux/bin` and `/compat/linux/usr/bin` are included in the default path via `/etc/path/inpath.cfg`. This means tools like `nano`, `tcc`, `git`, and `sl` can be launched directly by name at the shell without using `klcs run`. The explicit `klcs run` form remains available as a verbose diagnostic entry point.
+
+<Note>
+KLCS is not a complete Linux kernel ABI. Loader and libc startup, TLS, `mmap`/`brk`, file descriptor I/O, stat/open paths, time, randomness, and common startup stubs are wired for basic tool execution. Full syscall coverage is a work in progress; see `docs/klcs.md`.
+</Note>
+
+---
+
+## `fsctl` — Filesystem Command Surface
+
+All filesystem shell commands (`pwd`, `ls`, `cd`, `mkdir`, `touch`, `write`, `append`, `cat`, `stat`, `rm`, `rmdir`, `mv`, `cp`, `sync`) are registered by the `fsctl` service. The `xfsctl` command for low-level K64XFS tooling is registered by the `xfsctl` service.
+
+See [Filesystem Commands](/reference/fsctl-commands) for the complete reference.

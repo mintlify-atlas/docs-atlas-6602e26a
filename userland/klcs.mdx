@@ -1,0 +1,197 @@
+---
+title: "KLCS: K64 Linux Compatibility Service for x86_64 ELFs"
+sidebarTitle: "KLCS"
+description: "KLCS routes Linux x86_64 syscall frames into native K64 service calls, enabling static and dynamically-linked Linux ELFs like tcc, git, nano, and sl to run on K64."
+---
+
+KLCS is the K64 Linux Compatibility Service. It does not make K64 a Linux clone — it routes Linux application behavior into native K64 service calls, so K64 stays native by design and compatible by service. A Linux x86_64 ELF running under KLCS never sees real Linux kernel internals; it sees a K64-native service call translated response, an errno value translated from a K64 status code, and a path rooted inside the KLCS compatibility tree. The compatibility boundary is intentionally service-oriented: the kernel only needs to identify a Linux-personality process, collect the x86_64 syscall frame, and hand it to the `klcs` service.
+
+## Architecture
+
+```text
+Linux App → Linux syscall ABI → K64 syscall router → KLCS → K64 service calls → native K64 services
+```
+
+The `K64_PERSONALITY_LINUX_X86_64` process personality flag tells the K64 syscall router to forward incoming `syscall` instruction traps to `klcs_dispatch_syscall()` instead of the native service-call gate. All Linux syscall semantics live in KLCS, not scattered across kernel subsystems.
+
+## Two KLCS Layers
+
+KLCS is implemented in two cooperating layers:
+
+1. **Ring-3 Linux syscall-entry path** — A real x86_64 `syscall` entry gate for Linux-personality Ring-3 processes. Static Linux x86_64 ELFs run directly on this path. The `klcs_dispatch_syscall()` function receives a `klcs_linux_syscall_frame_t` containing the syscall number, six argument registers, the RIP, RSP, PID, and TID, and dispatches it to the appropriate K64 service call.
+
+2. **Staged dynamic-loader bridge** — For dynamically-linked Linux tools under `/compat/linux`, KLCS routes the program through the staged `/compat/linux/lib64/ld-linux-x86-64.so.2` loader path. TLS, anonymous `mmap`, `brk`, `arch_prctl`, `fstat`, `newfstatat`, `openat`, `read`, `pread64`, `writev`, `clock_gettime`, `getrandom`, and other common startup syscalls are wired far enough for basic staged tool execution.
+
+## Shell Usage
+
+```text
+klcs status
+klcs syscalls
+klcs trace on
+klcs trace off
+klcs trace
+klcs run <path> [args...]
+```
+
+`klcs status` prints a summary of KLCS state including total syscalls dispatched, unsupported syscall count, and trace status. `klcs syscalls` prints the full syscall support table. `klcs trace on` and `klcs trace off` enable or disable per-syscall trace logging into the ring buffer; `klcs trace` (no subcommand) dumps the recent trace ring.
+
+### `klcs run` Path Resolution
+
+`klcs run` accepts names in several forms and resolves them to the staged KLCS root:
+
+| Input form | Resolution |
+|---|---|
+| `tcc` | → `/compat/linux/bin/tcc` |
+| `/bin/tcc` | → `/compat/linux/bin/tcc` |
+| `/compat/linux/bin/tcc` | used directly |
+| `klcs-hello` | built-in smoke binary |
+
+Static x86_64 Linux ELFs are executed directly as Linux-personality Ring-3 processes. Dynamic ELFs with a `PT_INTERP` section are launched through the staged loader bridge.
+
+## Built-in Smoke Test
+
+```bash
+klcs run klcs-hello
+```
+
+Expected output:
+
+```text
+klcs-hello: Linux syscall ABI works
+```
+
+This smoke binary is built into the K64 image. It exercises the real Linux syscall path — `write` and `exit_group` — to confirm the KLCS Ring-3 entry gate and syscall dispatcher are functional.
+
+## Staged Dynamic Tool Checks
+
+After KLCS is installed, the following dynamic tool checks can be run:
+
+```bash
+tcc -v
+git --version
+nano --version
+sl
+```
+
+These tools are staged from real Linux packages into `/compat/linux` and run through the dynamic loader bridge. `sl` exercises the dynamic loader, ncurses, terminal metadata, `write`, `ioctl`, and `sleep` compatibility paths.
+
+## PATH-Based Auto-Launch
+
+The default `/etc/path/inpath.cfg` contains:
+
+```text
+/ex
+/compat/linux/bin
+/compat/linux/usr/bin
+```
+
+Staged Linux ELFs in `/compat/linux/bin` and `/compat/linux/usr/bin` are therefore reachable by name directly from the shell — no `klcs run` prefix needed. The explicit `klcs run <path>` form remains the verbose diagnostic command.
+
+<Note>
+  The shell resolves names in this order: built-in commands → service commands → service names → driver names → `/etc/path/inpath.cfg` entries. KLCS path entries come last, after K64-native paths.
+</Note>
+
+## Service Calls
+
+| Service call | Purpose |
+|---|---|
+| `klcs.status` | Return KLCS status text (total syscalls, unsupported count, trace state) |
+| `klcs.syscalls` | Return the full Linux syscall support table |
+| `klcs.syscall` | Dispatch one staged Linux syscall frame (`klcs_linux_syscall_frame_t`) |
+| `klcs.trace.enable` | Enable KLCS per-syscall tracing into the ring buffer |
+| `klcs.trace.disable` | Disable KLCS tracing |
+| `klcs.trace.dump` | Return the recent trace ring (up to `KLCS_TRACE_LINES` entries) |
+
+The `klcs.syscall` request payload is a `klcs_linux_syscall_frame_t`:
+
+```c
+typedef struct {
+    uint64_t nr;    // Linux syscall number
+    uint64_t arg0;  // rdi
+    uint64_t arg1;  // rsi
+    uint64_t arg2;  // rdx
+    uint64_t arg3;  // r10
+    uint64_t arg4;  // r8
+    uint64_t arg5;  // r9
+    uint64_t rip;   // instruction pointer at syscall site
+    uint64_t rsp;   // stack pointer at syscall site
+    uint64_t pid;   // K64 process ID
+    uint64_t tid;   // thread ID (same as pid for single-threaded processes)
+} klcs_linux_syscall_frame_t;
+```
+
+## Implemented Syscall Foundation
+
+The KLCS dispatcher has implementations or minimal stubs for the following Linux x86_64 syscalls:
+
+```text
+read          write         writev        pread64       pwrite64
+poll          open          openat        close         fstat
+newfstatat    lseek         access        statx         getdents64
+fcntl         ftruncate     mkdir         mkdirat       rmdir
+unlink        unlinkat      rename        renameat2     chmod
+fchmod        faccessat     utimensat     umask
+mmap          munmap        mprotect      mremap        brk
+uname         readlink      readlinkat    arch_prctl    set_tid_address
+rt_sigaction  rt_sigprocmask sigaltstack  set_robust_list futex
+clock_gettime prlimit64     getrandom     rseq
+getpid        gettid        getppid       getuid        geteuid
+getgid        getegid       exit          exit_group
+```
+
+Unsupported syscalls return Linux `-ENOSYS` (38), not K64-native error codes.
+
+## Path Model
+
+KLCS translates Linux filesystem paths into K64 paths before passing them to K64 service calls:
+
+| Linux path | K64 translation |
+|---|---|
+| `/` | `/compat/linux/root` |
+| `/tmp` | `/tmp` |
+| `/home` | `/home` |
+| `/dev/null` | KLCS pseudo-device: explicit null device |
+| `/dev/zero` | KLCS pseudo-device: explicit zero device |
+| `/dev/random` | KLCS pseudo-device: explicit random device |
+| `/dev/urandom` | KLCS pseudo-device: explicit urandom device |
+| `/proc/self/exe` | Resolved to the launched executable path |
+| Other absolute paths | Rooted under `/compat/linux/root` |
+
+Linux apps cannot escape the compatibility root unless KLCS explicitly maps the path. Arbitrary `/dev` access is not allowed — only the explicit KLCS pseudo-device paths above are handled.
+
+## Security Rules
+
+<Warning>
+  KLCS does not grant Linux apps elevated K64 privileges. All Linux-personality processes run with normal K64 user credentials.
+</Warning>
+
+- Linux apps launched through KLCS run with normal K64 user credentials — no privilege elevation
+- Linux `errno` values are returned to Linux apps; K64 internal errors are translated through `klcs_linux_errno_from_k64()`
+- ELF headers and program-header bounds are checked before any binary is accepted (`klcs_validate_elf64()`)
+- Dynamic ELF payloads are routed through the staged loader bridge and still run under normal K64 user credentials
+- KLCS pseudo-devices are explicit; arbitrary `/dev` access is not allowed
+- KLCS is not required for K64 boot — it is a service-level addition
+
+## Current Scope and Limitations
+
+<Note>
+  KLCS is not a full Linux kernel ABI. It is a compatibility service for staged tool execution.
+</Note>
+
+What is wired for basic staged tool execution:
+
+- Loader and libc startup (TLS, `mmap`/`brk`, `arch_prctl`, `set_tid_address`)
+- File I/O (`open`, `read`, `write`, `close`, `fstat`, `lseek`, `getdents64`)
+- Stat and path operations (`stat`, `openat`, `newfstatat`, `access`, `readlink`)
+- Time and randomness (`clock_gettime`, `getrandom`)
+- Common startup stubs (`rt_sigaction`, `rt_sigprocmask`, `set_robust_list`, `rseq`, `prlimit64`)
+
+What is not yet supported:
+
+- **HTTPS**: rejected until K64 has TLS support
+- **Full signal delivery**: `rt_sigaction` and `rt_sigprocmask` are stubbed
+- **Fork/exec**: Linux apps cannot `fork()` or `execve()` outside the KLCS loader path
+- **Complete `ioctl` surface**: only the terminal-metadata path is wired
+- **Large interactive workflows**: `nano` works for basic editing; large `git` workflows may hit missing syscalls
+
+Unsupported syscalls return Linux `-ENOSYS`. The `klcs.trace.enable` / `klcs.trace.dump` pair is the recommended way to identify which syscalls a failing Linux program is calling.

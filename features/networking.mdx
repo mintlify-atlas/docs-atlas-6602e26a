@@ -1,0 +1,124 @@
+---
+title: "K64 Networking: RTL8139, e1000, ARP, DHCP, DNS, TCP, and kcurl"
+sidebarTitle: "Networking"
+description: "K64's Ethernet stack covers RTL8139 and Intel e1000 NIC drivers, ARP/DHCP/DNS resolution, ICMP ping, UDP send, TCP outbound, and an HTTP/1.0 kcurl client."
+---
+
+K64 ships a full first-generation Ethernet stack built on top of the driver model. The network subsystem is implemented in `k64_net.c` / `k64_net.h` and backed by two hardware drivers — `rtl8139.k64m` for QEMU and legacy VMs, and `e1000.k64m` for VMware-compatible environments — each of which scans PCI config space, initialises the NIC, discovers the MAC address, and registers a send callback with the shared network layer. Once a device is registered, the `netctl` service exposes the full runtime surface to the shell: DHCP, ARP, DNS, ICMP, UDP, TCP, and the `kcurl` HTTP/1.0 client.
+
+## Hardware Support
+
+K64's NIC drivers are registered through the driver model and started automatically during boot.
+
+| NIC | Initialization | Recommended VM |
+|-----|---------------|----------------|
+| **RTL8139** | I/O BAR (PCI config-space scan) | QEMU (default), legacy VMs |
+| **Intel e1000** | MMIO (PCI config-space scan) | VMware, QEMU with `-device e1000` |
+
+Both drivers perform the same post-init steps: discover the hardware MAC address, initialize transmit and receive rings / buffers, and register the device with `k64_net_register_device()`. The shared layer stores the active device and dispatches outgoing frames through the registered `k64_net_send_frame_fn` callback.
+
+<Note>
+For VMware, configure the virtual NIC type as **e1000 / Intel E1000**. The default QEMU targets attach an RTL8139 NIC. The RTL8139 driver uses a **32 KiB receive ring** so that package-sized HTTP downloads do not overflow the old small receive window.
+</Note>
+
+## Protocol Stack Capabilities
+
+### Ethernet and ARP
+
+`k64_net_receive_frame()` dispatches incoming Ethernet frames by EtherType. ARP requests targeting K64's IP are answered automatically; outbound ARP requests are sent with `k64_net_send_arp_request()`. The network status structure (`k64_net_status_t`) tracks per-protocol receive counters: `rx_arp`, `rx_ipv4`, `rx_udp`, `rx_icmp`, `rx_tcp`, and `rx_dns`.
+
+### DHCP
+
+`k64_net_dhcp_discover()` performs a DHCP discover/request exchange. On a QEMU user-mode network the DHCP server reliably returns the standard NAT addresses. If DHCP fails or is not run, K64 falls back to a built-in identity that matches QEMU user networking:
+
+| Field | Default value |
+|-------|--------------|
+| IPv4 address | `10.0.2.15` |
+| Gateway | `10.0.2.2` |
+| DNS server | `10.0.2.3` |
+| Netmask | `255.255.255.0` |
+
+### ICMP
+
+`k64_net_send_ping()` sends an ICMP echo request and increments `ping_replies` when an echo reply arrives. Inbound ICMP echo requests from remote hosts are answered automatically by the receive path.
+
+### UDP
+
+`k64_net_send_udp()` constructs a UDP datagram with a correct IPv4/UDP checksum and delivers it to any reachable `(dst_ip, dst_port)` pair.
+
+### DNS
+
+`k64_net_resolve_host()` sends a DNS A-query using the DHCP-provided (or fallback) DNS server and caches the result. The `pending` output flag signals that a query is in flight; poll again after a short wait if it is set.
+
+### TCP and kcurl
+
+K64 includes a minimal outbound TCP client path sufficient for plain HTTP/1.0 downloads. Three raw HTTP helpers are exposed by the network layer:
+
+```c
+bool k64_net_http_get(const char* host, const char* path, uint16_t port,
+                      char* out, size_t out_size, const char** state);
+
+bool k64_net_http_get_raw(const char* host, const char* path, uint16_t port,
+                          uint8_t* out, size_t out_capacity,
+                          size_t* out_size, const char** state);
+
+bool k64_net_http_get_range_raw(const char* host, const char* path, uint16_t port,
+                                size_t range_start, size_t range_end,
+                                uint8_t* out, size_t out_capacity,
+                                size_t* out_size, const char** state);
+```
+
+The HTTP client is **binary-safe**: it tracks `Content-Length`, completes the response before the peer closes the connection, validates `206 Partial Content` range responses, preserves embedded zero bytes, and tolerates overlapping TCP retransmits so repeated packet delivery does not corrupt HTTP response bodies. The higher-level `k64_net_http_download_to_file()` helper downloads directly to a K64XFS path.
+
+The shell-visible `kcurl` command exposes this path for plain `http://` URLs:
+
+```text
+kcurl http://host[:port]/path
+```
+
+<Warning>
+**HTTPS is intentionally rejected.** `kcurl` and KPM only support `http://` URLs until K64 has TLS support. Attempting an `https://` URL returns an immediate error. This is also **not** a POSIX socket API — there are no `socket()`, `connect()`, or `send()` syscalls.
+</Warning>
+
+## Default Fallback Network Identity
+
+If DHCP is not run (or fails), K64 uses the following static identity, which matches QEMU user networking by design:
+
+```text
+IPv4:    10.0.2.15
+Gateway: 10.0.2.2
+DNS:     10.0.2.3
+Netmask: 255.255.255.0
+```
+
+## netctl Command Reference
+
+The `netctl` service registers all network-facing commands with the shell dispatcher. The `ping` and `kcurl` commands are also registered at the top level.
+
+| Command | Description |
+|---------|-------------|
+| `netctl status` | Print NIC driver, MAC address, IP/gateway/DNS/netmask, link state, and per-protocol receive counters |
+| `netctl poll` | Poll the receive ring once and dispatch any pending inbound frames |
+| `netctl dhcp` | Run DHCP discover/request and update the network identity |
+| `netctl resolve <host>` | Send a DNS A-query for `<host>` and print the resolved IPv4 address |
+| `netctl arp <ipv4>` | Send an ARP request for `<ipv4>` and print the reply MAC |
+| `ping <ipv4\|host>` | Send an ICMP echo to an IP or a hostname (resolved via DNS) |
+| `kcurl http://host[:port]/path` | Fetch a plain HTTP resource and print the response body |
+| `udp send <ipv4> <port> <text>` | Send a UDP datagram containing `<text>` to the given destination |
+
+## Usage Examples
+
+```text
+netctl status
+netctl dhcp
+netctl resolve example.com
+netctl arp 10.0.2.2
+netctl poll
+ping example.com
+kcurl example.com
+udp send 10.0.2.2 9 hello-from-k64
+```
+
+<Tip>
+Run `netctl dhcp` first on every fresh boot to populate the IP, gateway, and DNS fields before using `ping`, `kcurl`, or `kpm install`. The fallback static identity already works for basic QEMU connectivity, but DHCP ensures accurate settings in VMware and custom VM configurations.
+</Tip>

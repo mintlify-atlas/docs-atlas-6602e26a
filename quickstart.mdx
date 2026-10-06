@@ -1,47 +1,197 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with K64 in QEMU"
+sidebarTitle: "Quickstart"
+description: "Build the K64 ISO and boot it in QEMU in under ten minutes. Covers dependency installation, make targets, and first shell commands."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+K64 boots through GRUB as a Multiboot v1 payload and attaches a persistent K64XFS disk image alongside the ISO. The fastest way to reach the interactive shell is to build `k64.iso` with a single `make` invocation and then launch it with `make run`. This guide walks through every step from a fresh clone to your first shell session, using Fedora as the reference platform.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before building you will need the following tools installed:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+| Tool | Purpose |
+|---|---|
+| `gcc` | Host C compiler (kernel and userland sources) |
+| `make` | Build orchestration |
+| `python3` | Rootfs image builder, version generator, module compiler |
+| `qemu-system-x86_64` | Virtual machine for running K64 |
+| `grub2-tools` | `grub-mkrescue`, `grub-mkimage`, `grub-file` |
+| `xorriso` | ISO image creation (used by `grub-mkrescue`) |
+| `rsync` | Rootfs staging |
 
-## Get started
+**Optional:** `x86_64-elf-gcc` and `x86_64-elf-ld` cross-compilers are preferred by the Makefile. If they are absent the build falls back to the host `gcc` and `ld`. `clang` is also supported as a fallback.
+
+<Note>
+  The build also requires GRUB source headers to compile `grub/k64xfs.c` into a `k64xfs.mod` GRUB module. By default the build helper looks for them at `/tmp/grub-src`. Override this with the `GRUB_SRC` environment variable if your headers live elsewhere.
+</Note>
+
+---
+
+## Steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository">
+    Clone K64 from GitHub and enter the project directory:
 
     ```bash
-    npm install your-package
+    git clone https://github.com/K64-Labs/K64.git
+    cd K64
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Install dependencies">
+    On Fedora (or a compatible dnf-based distribution), install all required tools in one command:
 
     ```bash
-    your-cli init
+    sudo dnf install -y gcc make python3 qemu-system-x86_64 grub2-tools xorriso rsync
+    ```
+
+    To install the optional cross-compiler (recommended for a cleaner freestanding build):
+
+    ```bash
+    sudo dnf install -y gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu
     ```
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Build the ISO">
+    Run `make` from the project root:
 
     ```bash
-    your-cli start
+    make
     ```
+
+    The build performs these steps automatically:
+
+    1. Generates `build/k64_autoversion.h` from the git commit count plus the major/minor baseline in `k64_version.h`.
+    2. Compiles and links the kernel ELF (`k64-kernel-v<version>.elf`).
+    3. Compiles assembly ELF samples and C userland programs into `build/ex/`.
+    4. Compiles `k64s_def/*.svc` source definitions into binary `.k64s` files and `k64m_def/*.drv` source definitions into binary `.k64m` files.
+    5. Stages everything into `build/rootfs/`, then runs `tools/mk_k64xfs.py` to produce `build/root.xfs`.
+    6. Builds `build/root.disk` — a raw disk image with a BIOS boot area at LBA 0 and a K64XFS partition at LBA 2048.
+    7. Runs `grub-mkrescue` to produce `k64.iso`.
+
+    On success you will have two output artifacts: **`k64.iso`** (the bootable CD image) and **`build/root.disk`** (the persistent writable disk).
+  </Step>
+
+  <Step title="Boot in QEMU">
+    Launch K64 in QEMU with serial output on your terminal:
+
+    ```bash
+    make run
+    ```
+
+    This expands to:
+
+    ```bash
+    qemu-system-x86_64 \
+      -boot order=d \
+      -cdrom k64.iso \
+      -drive file=build/root.disk,format=raw,if=ide,index=0 \
+      -netdev user,id=k64net \
+      -device rtl8139,netdev=k64net \
+      -serial stdio \
+      -no-reboot \
+      -no-shutdown
+    ```
+
+    Key flags explained:
+
+    | Flag | Purpose |
+    |---|---|
+    | `-boot order=d` | Force CD-ROM as the first boot device |
+    | `-cdrom k64.iso` | The bootable ISO built by `make` |
+    | `-drive file=build/root.disk,if=ide,index=0` | Persistent K64XFS disk; the ATA driver mounts it as `ata0p1` |
+    | `-device rtl8139,netdev=k64net` | Virtual RTL8139 NIC for networking commands |
+    | `-serial stdio` | Route K64 serial output to your terminal |
+
+    GRUB loads, the kernel initializes, drivers and services start, and you arrive at the login prompt.
+  </Step>
+
+  <Step title="Log in as guest">
+    K64 starts the shell behind a login gate. The default live account is:
+
+    - **Username:** `guest`
+    - **Password:** `guest`
+
+    After a successful login the shell prompt appears:
+
+    ```text
+    [guest]@K64 ~/ >>>
+    ```
+
+    Root is also available (`root` / `root`) for administrative commands.
+  </Step>
+
+  <Step title="Try your first commands">
+    Once you are at the shell, try a few built-in and service-backed commands to confirm everything is working:
+
+    ```text
+    help
+    ```
+
+    Lists all recognized shell built-ins and service-registered commands.
+
+    ```text
+    ls /
+    ```
+
+    Lists the root of the K64XFS filesystem. You should see directories such as `boot`, `etc`, `ex`, `k64m`, `k64s`, `tmp`, `usr`, and `var`.
+
+    ```text
+    servicectl list
+    ```
+
+    Prints the running service registry — PID, state, class, name, and VM base for each entry.
+
+    ```text
+    driverctl list
+    ```
+
+    Prints the driver registry — ID, state, name, and source binary path.
+
+    ```text
+    storagectl list
+    ```
+
+    Prints registered block devices with geometry and human-readable size. In the default QEMU flow you should see `ata0` (whole disk) and `ata0p1` (K64XFS partition).
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+---
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+## Headless Mode
+
+<Tip>
+  If you do not need a QEMU display window — for example when running inside a WSL terminal or a CI environment — use `make run-headless` instead. It passes `-nographic` to QEMU, routing all output (VGA text and serial) through the terminal.
+
+  ```bash
+  make run-headless
+  ```
 </Tip>
+
+## Custom Disk Size
+
+The default `build/root.disk` image is **32 MiB**. To build with a larger persistent disk, set `K64_DISK_SIZE` before invoking `make`:
+
+```bash
+K64_DISK_SIZE=128M make k64.iso
+```
+
+The MBR partition entry inside the boot area is updated to match `K64_DISK_SIZE` automatically. The root filesystem image size is controlled separately by `ROOTFS_IMAGE_SIZE` (default `16M`).
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Building" icon="hammer" href="/building">
+    Toolchain detection, all Makefile targets, CFLAGS explained, rootfs staging flow, and ISO creation details.
+  </Card>
+  <Card title="Architecture Overview" icon="layer-group" href="/architecture/overview">
+    Boot flow, initialization order, VMM design, scheduler, and the driver/service runtime in depth.
+  </Card>
+  <Card title="Shell Commands Reference" icon="terminal" href="/reference/shell-builtins">
+    Every built-in and service-registered command, with examples and flag descriptions.
+  </Card>
+</CardGroup>

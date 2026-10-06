@@ -1,0 +1,150 @@
+---
+title: "K64 Native Userland libc: Minimal C Runtime for Ring-3 Programs"
+sidebarTitle: "Userland libc"
+description: "K64's thin freestanding libc covers crt0 startup, service-call wrappers for I/O and process control, fd operations, string/memory helpers, and a set of ring-3 smoke programs."
+---
+
+K64's libc seed is intentionally tiny. It is the first stable nongraphical ABI surface for growing a real K64 userland without writing every program in assembly. Rather than implementing a full C standard library, it provides exactly what is needed to write useful ring-3 programs today: a `_start` entry point, wrappers around the `service_call` syscall gate for common operations, process and fd control helpers, and a small set of string and memory utilities. Sample programs built with it serve as both smoke tests and reference implementations.
+
+## Key Source Files
+
+| File | Role |
+|---|---|
+| `userland/include/k64/libc.h` | Public libc header — declarations for all wrappers and helpers |
+| `userland/lib/crt0.S` | Assembly `_start` entry point; calls `main()` then invokes `proc.exit` |
+| `userland/lib/k64libc.c` | C implementations of service-call wrappers and helpers |
+| `userland/bin/*.c` | Sample user programs compiled against the libc shim |
+
+## Build Flags
+
+User programs are compiled with a dedicated set of freestanding flags from the Makefile (`USER_CFLAGS`):
+
+```text
+-ffreestanding
+-fno-stack-protector
+-fno-pic
+-fno-pie
+-mno-red-zone
+-mno-sse
+```
+
+These flags ensure that the compiled programs do not depend on kernel-provided stack cookies, position-independent code helpers, the red-zone scratch area (which would conflict with interrupt delivery in ring 3), or SSE registers (which the K64 kernel does not save/restore on context switches).
+
+## What libc Provides
+
+### Startup
+
+`_start` (in `crt0.S`) is the ELF entry point. It sets up the stack frame, calls `main(argc, argv)`, and exits via the `proc.exit` service call using the return value of `main`. User programs do not need to call `exit` manually.
+
+### Service-Call Wrappers
+
+The libc exposes named C wrappers around `k64_service_call()` and `k64_service_call_ex()` for every common userland operation:
+
+| Wrapper category | Operations covered |
+|---|---|
+| Console output | Write strings and formatted output to stdout/stderr |
+| File I/O | `io.open`, `io.read`, `fs.write_file`, `io.close` |
+| Directory listing | `fs.list_dir` |
+| File move | `fs.move` |
+| Key input | `term.readkey` (blocking) and non-blocking key poll |
+| Cursor control | Set cursor position, query terminal size (`term.size`) |
+| Text cell blitting | Blit styled text cells to the VGA framebuffer |
+| Process control | `proc.spawn`, `proc.getpid`, `proc.exit` |
+| Pipes | `io.pipe` — create anonymous read/write pipe endpoints |
+| Uptime | `kernel.uptime` |
+
+The raw service-call interface is also directly available:
+
+```c
+int64_t k64_service_call(const char* service, const char* method,
+                         const void* req, uint64_t req_len,
+                         void* resp, uint64_t resp_len);
+
+int64_t k64_service_call_ex(const char* service, const char* method,
+                             const void* req, uint64_t req_len,
+                             void* resp, uint64_t resp_len,
+                             uint64_t flags);
+```
+
+### Process Wrappers
+
+```c
+bool     proc_info(uint64_t pid, k64_proc_info_t* out);
+int64_t  waitpid(uint64_t pid, int64_t* exit_code);
+int64_t  waitpid_flags(uint64_t pid, int64_t* exit_code, uint64_t flags);
+```
+
+`waitpid_flags` accepts `K64_WAIT_BLOCK` (wait until child exits) or `K64_WAIT_NOHANG` (return `K64_ERR_AGAIN` immediately if child is still running).
+
+### String and Memory Helpers
+
+The libc includes minimal freestanding implementations of:
+
+- String: `k64_strlen`, `k64_strcpy`, `k64_strncpy`, `k64_strcmp`, `k64_strncmp`, `k64_strchr`, `k64_strcat`
+- Memory: `k64_memset`, `k64_memcpy`, `k64_memcmp`
+- Numeric output: decimal and hexadecimal integer-to-string formatting helpers
+- Console helpers: `k64_putstr`, `k64_putchar`, `k64_putuint`, `k64_puthex`
+
+These helpers are freestanding — no dependency on the host C library.
+
+## What libc Is NOT
+
+<Warning>
+  This is not a full C standard library. The following capabilities are outside scope for K64's current libc seed:
+</Warning>
+
+- No `fork` or `execve` — the K64 process model uses `proc.spawn` instead
+- No dynamic linker or shared-library loading for K64-native programs
+- No socket API or network I/O from userland
+- No `stdio.h` buffered I/O (`FILE*`, `printf`, `fgets`, etc.)
+- No `malloc`/`free` heap allocator — programs manage memory on the stack or in static buffers
+- No signal delivery (`signal`, `sigaction`)
+
+## Sample Programs
+
+### C Programs (built from `userland/bin/*.c`)
+
+<CardGroup cols={3}>
+  <Card title="procinfo.elf" icon="microchip">
+    Demonstrates the C userland path and the `proc.getpid` and `kernel.uptime` service calls. Prints the current PID and system uptime.
+  </Card>
+  <Card title="libctest.elf" icon="flask">
+    Comprehensive libc smoke test. Exercises string helpers, memory helpers, file `io.open`/`io.read`/`io.close`, process IDs, uptime output, fd behavior, pipe behavior, direct service calls, and checked syscall memory failures from ring 3.
+  </Card>
+  <Card title="edit.elf" icon="pen-to-square">
+    A nano-like text editor. Run `edit /tmp/note.txt`, type text, use arrow keys for navigation, `Enter` for new lines, `Backspace`/`Delete` for editing, `Ctrl-S` (or `@s`) to save, `Ctrl-Q` (or `@q`) to quit. Uses key-event, cursor, stdin, and `fs.write_file` service calls.
+  </Card>
+</CardGroup>
+
+### Assembly-Only Programs (from `ex/*.S`)
+
+<CardGroup cols={3}>
+  <Card title="hello.elf" icon="terminal">
+    Uses the `int 0x80` syscall path to write text and exit from ring 3. The simplest possible ring-3 program — useful as a baseline for verifying the ELF loader and syscall gate.
+  </Card>
+  <Card title="catmotd.elf" icon="file-lines">
+    Opens `/etc/motd` and reads its contents through the syscall layer. Demonstrates user-mode read-only file I/O in assembly without the libc shim.
+  </Card>
+  <Card title="args.elf" icon="list">
+    Demonstrates shell-style argument passing. Running `args alpha beta` enters the program with `argc=3` and prints each argument. Shows that the ELF loader and shell cooperate to pass argv correctly.
+  </Card>
+</CardGroup>
+
+## Minimal C Program Example
+
+The following is a minimal C program that compiles and runs under K64's libc:
+
+```c
+#include <k64/libc.h>
+
+int main(int argc, char** argv) {
+    k64_putstr("hello from K64 userland\n");
+    return 0;
+}
+```
+
+This program links against `crt0.S` and `k64libc.c`. The `_start` entry point calls `main()`, receives the return value `0`, and exits through the `proc.exit` service call. No OS-provided startup infrastructure beyond what the K64 libc shim provides is needed.
+
+<Tip>
+  Use `libctest.elf` as the reference program when writing new K64 userland code in C. It exercises every major libc wrapper category and serves as a checklist for what the API surface covers.
+</Tip>

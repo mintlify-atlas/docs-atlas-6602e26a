@@ -1,0 +1,127 @@
+{
+  "projectType": "general",
+  "projectName": "K64",
+  "projectDescription": "An experimental 64-bit x86_64 kernel with GRUB/Multiboot boot support, a custom K64XFS filesystem, a registry-based driver/service runtime, interactive shell, usermode ELF execution, and a Linux compatibility layer (KLCS).",
+  "theme": "aspen",
+  "primaryColor": "#2563EB",
+  "lightColor": "#60A5FA",
+  "darkColor": "#1E3A6E",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "building"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/boot",
+              "architecture/memory",
+              "architecture/scheduler"
+            ]
+          },
+          {
+            "group": "Drivers & Services",
+            "pages": [
+              "runtime/driver-model",
+              "runtime/service-model",
+              "runtime/shell"
+            ]
+          },
+          {
+            "group": "Filesystem",
+            "pages": [
+              "filesystem/k64xfs",
+              "filesystem/commands",
+              "filesystem/grub-module"
+            ]
+          },
+          {
+            "group": "Userland",
+            "pages": [
+              "userland/elf-loader",
+              "userland/syscall-abi",
+              "userland/libc",
+              "userland/klcs"
+            ]
+          },
+          {
+            "group": "System Features",
+            "pages": [
+              "features/networking",
+              "features/users-permissions",
+              "features/kpm",
+              "features/storage"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Shell Commands",
+            "pages": [
+              "reference/shell-builtins",
+              "reference/service-commands",
+              "reference/fsctl-commands"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "reference/boot-config",
+              "reference/artifact-formats"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "reference/extending-k64",
+              "reference/testing"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "GRUB/Multiboot-booted 64-bit x86_64 kernel with paged long-mode setup",
+    "Custom K64XFS filesystem with GRUB module support, block-backed persistence, journaling skeleton, and xfsctl tooling",
+    "Registry-based driver (.k64m) and service (.k64s) runtime with lifecycle management and async scheduling",
+    "Priority-aware cooperative scheduler with worker tasks, yield/sleep, and PIT-driven tick source",
+    "Ring-3 user-mode ELF execution with per-process page tables and int 0x80 syscall gate",
+    "Service-call ABI (syscall 25) bridging userland to native K64 service methods",
+    "KLCS – K64 Linux Compatibility Service for running static and dynamically-linked x86_64 Linux ELFs",
+    "Interactive shell backed by a managed async service with history, cursor editing, and PS/2 + serial input",
+    "Ethernet networking (RTL8139 / Intel e1000), ARP, DHCP, DNS, ICMP, UDP, TCP, and kcurl HTTP client",
+    "KPM package manager client consuming a plain HTTP package repository in .kpg binary format",
+    "POSIX-like multiuser permission model with hashed passwords, sudo, UID/GID ownership, and mode bits",
+    "ATA PIO block layer with MBR partition support and storagectl installer flow"
+  ],
+  "publicApiSurface": [
+    "k64_modules_register_driver() — register a driver in the .k64m registry",
+    "k64_system_register_service() — register a service in the .k64s registry",
+    "k64_system_register_command() — register a shell-visible service command",
+    "k64_system_register_call() — register a named service-call method",
+    "k64_system_dispatch_call() — invoke a service method by service+method name",
+    "k64_fs_write_file() / k64_fs_read_file_raw() / k64_fs_stat() — filesystem access",
+    "k64_fs_sync() / k64_fs_is_persistent() — persistence helpers",
+    "k64_modules_start_driver() / k64_modules_stop_driver() / k64_modules_restart_driver()",
+    "k64_system_start_service() / k64_system_stop_service() / k64_system_restart_service()",
+    "Syscall 25: service_call(call_ptr) — userland-to-kernel service call gate",
+    "Shell built-in commands: help, clear, ps, sched, reboot, shutdown, layout, ticks, task, serial, echo, yield, panic",
+    "Service commands: servicectl, driverctl, storagectl, netctl, fsctl, userctl, kpm, elfrun, reload, sysfetch, uname, k64cc, klcs",
+    ".k64m binary artifact format (K64M magic, version, type, flags, priority, name, entry_path)",
+    ".k64s binary artifact format (K64S magic, version, class, flags, priority, poll_interval, name, entry_path)",
+    "Boot config keys: pit_hz, log_level, boot_mode (GRUB multiboot command line)"
+  ]
+}

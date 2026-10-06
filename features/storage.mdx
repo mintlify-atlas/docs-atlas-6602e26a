@@ -1,0 +1,111 @@
+---
+title: "K64 Block Storage: ATA, MBR Partitions, and storagectl"
+sidebarTitle: "Storage"
+description: "K64's block layer registers ATA PIO disks and MBR partitions, exposes them through storagectl, and supports installing the K64XFS root filesystem to a persistent target disk."
+---
+
+K64's storage subsystem is organized as a thin block-device abstraction layer over an ATA PIO hardware driver, with partition views layered on top of whole-disk devices and a K64XFS filesystem driver that mounts from the first suitable partition found at boot. The runtime control surface is the `storagectl` service, which lets you inspect disks, partition them, check filesystem capacity, flush writes, and install K64 to a persistent target disk.
+
+## Block Layer Overview
+
+The block layer (`k64_block.c` / `k64_block.h`) provides:
+
+- **Device registration**: any driver can register a block device with a name, block size, block count, read/write callbacks, and a writability flag via `k64_block_register_device()`.
+- **Read/write dispatch by LBA**: `k64_block_read()` and `k64_block_write()` dispatch to the owning driver's callbacks by logical block address.
+- **Device enumeration**: `k64_block_device_count()`, `k64_block_device_at()`, and `k64_block_find_device_by_name()` let the filesystem driver and `storagectl` service iterate registered devices.
+- **Partition views**: `k64_block_scan_partitions()` reads a disk's MBR and registers each partition as a child block device (e.g. `ata0p1`) with its own `start_lba`, `block_count`, and `partition_type` fields.
+
+```c
+typedef struct k64_block_device {
+    uint64_t           id;
+    char               name[32];
+    char               source[48];
+    uint32_t           block_size;
+    uint64_t           block_count;
+    uint64_t           start_lba;
+    uint8_t            partition_type;
+    bool               is_partition;
+    bool               writable;
+    bool               online;
+    void*              context;
+    k64_block_read_fn  read;
+    k64_block_write_fn write;
+} k64_block_device_t;
+```
+
+## ATA PIO Driver
+
+The built-in ATA PIO driver (`k64_ata.c` / `k64_ata.h`) starts via `k64_ata_driver_start()` and:
+
+1. Probes both the **primary** and **secondary** IDE channels.
+2. Registers up to four disks as `ata0`, `ata1`, `ata2`, and `ata3`.
+3. Calls `k64_block_scan_partitions()` on each disk, exposing MBR partitions as `ata0p1`, `ata0p2`, etc.
+
+The driver is registered as `ata.k64m` in the driver registry and is autostarted during bootstrap.
+
+## Default QEMU Boot Flow
+
+In the standard `make run` configuration:
+
+1. `make` builds `build/root.disk` — a disk image with a BIOS boot area at LBA 0 and a K64XFS partition starting at LBA 2048.
+2. QEMU attaches `build/root.disk` as an IDE hard disk alongside the boot ISO.
+3. The ATA driver registers the disk as `ata0` and scans its MBR.
+4. The filesystem driver (`fs.k64m`) finds a valid K64XFS header at `ata0p1` and mounts it as the persistent root.
+
+K64XFS distinguishes the **mounted volume size** from the initial root image size. On an installed 8 GiB disk, a partition like `ata3p1` reports roughly **7.9 GiB of K64XFS volume capacity** — not the small ISO-root image size.
+
+## storagectl Command Reference
+
+| Command | Description | Notes |
+|---------|-------------|-------|
+| `storagectl list` | Print each registered disk and partition with block count and human-readable KiB/MiB/GiB size | Includes mode, geometry, and writability |
+| `storagectl partitions <device>` | Read the MBR of `<device>` and report each partition plus unallocated space | Whole-disk devices only |
+| `storagectl partition <device> k64 yes` | Write a simple K64 MBR layout: one active Linux-type partition from LBA 2048 using the rest of the disk | **Confirmation-gated** — overwrites the partition table |
+| `storagectl root` | Report the mounted rootfs source, persistent mode flag, and used/free/total K64XFS volume capacity | |
+| `storagectl sync` | Flush the mounted K64XFS image to the backing block device | Same effect as bare `sync` |
+| `grow /` | Refresh the mounted K64XFS root volume capacity from the backing partition | Useful after installing to a larger disk |
+| `install` | Print installer guidance and list writable target disks | Safe — read-only |
+| `install <device> yes` | Write GRUB BIOS boot area + current K64XFS root filesystem to `<device>` | **Confirmation-gated** — overwrites boot area and filesystem |
+| `sync` | Global filesystem flush (shell built-in) | Calls the same underlying flush path |
+
+<Note>
+`storagectl list` output includes both whole-disk devices (e.g. `ata0`) and their partition children (e.g. `ata0p1`). Block counts are reported in the device's native block size; human-readable sizes are derived from `block_count × block_size`.
+</Note>
+
+## K64XFS Volume vs. Image Size
+
+The K64XFS superblock records the **volume capacity** independently of the initial image file size. When you run `storagectl partition <device> k64 yes` followed by `install <device> yes`, the installer patches the MBR partition size to match the actual target disk geometry. After a subsequent `grow /`, the running system sees the full partition capacity rather than the smaller development image size.
+
+## Installer Flow
+
+<Steps>
+  <Step title="Boot from ISO in installer mode">
+    Select the **Install K64** entry in the GRUB menu. This passes `boot_mode=installer` to the kernel, which opens the text installer guide after boot.
+  </Step>
+  <Step title="Identify the target disk">
+    Run `install` to print installer guidance and the list of writable target disks visible to the ATA driver.
+  </Step>
+  <Step title="Create a login account (optional)">
+    Run `install user <name> <password> [sudo]` to add an account to `/etc/users.k64` before the image is written. The installed system will boot with this account instead of relying solely on the default `guest` credentials.
+  </Step>
+  <Step title="Write the root filesystem to the target disk">
+    Run `install <device> yes` (e.g. `install ata1 yes`) to write the GRUB BIOS boot area and the K64XFS root filesystem to the target disk. The installer confirmation gate prevents accidental overwrites.
+  </Step>
+  <Step title="Remove the ISO and boot from the target disk">
+    Detach the ISO image and reboot. GRUB reads `/boot/grub/grub.cfg` from the K64XFS partition and loads the kernel directly from the installed disk.
+  </Step>
+</Steps>
+
+## Disk Image Size
+
+The default development disk image is **32 MiB**. You can override this with the `K64_DISK_SIZE` environment variable at build time:
+
+```text
+K64_DISK_SIZE=128M make k64.iso
+```
+
+The MBR partition size inside the boot area tracks `K64_DISK_SIZE`. `build/root.disk` is also bootable as a standalone BIOS disk: a GRUB BIOS boot area is embedded at LBA 0 and the K64XFS root begins at LBA 2048.
+
+<Warning>
+`storagectl partition <device> k64 yes` and `install <device> yes` are both confirmation-gated because they **overwrite the target disk's partition table and boot area**. Double-check the device name with `storagectl list` before confirming either command.
+</Warning>

@@ -1,0 +1,151 @@
+---
+title: "K64 Runtime Architecture: Layers and Design Goals"
+sidebarTitle: "Overview"
+description: "Four-layer runtime architecture: boot/CPU setup, core kernel runtime, driver/service control planes, and K64XFS root filesystem. Explains the mechanism-vs-policy split."
+---
+
+K64 is a small experimental 64-bit kernel for x86_64. Its runtime is deliberately organized in layers: the kernel core does the minimum needed to bring up the machine and hand authority outward, while drivers, services, and the root filesystem carry most user-visible behavior. This page describes how those layers connect, what each one owns, and where the current boundaries still are.
+
+## The Four Layers
+
+### Layer 1: Boot and CPU Mode Setup
+
+The lowest layer is purely machine-level. GRUB loads the kernel as a Multiboot v1 payload, then two assembly files do the minimum work required to enter 64-bit mode:
+
+- **`boot.s`** runs in 32-bit protected mode. It saves the Multiboot magic value and info pointer, builds a temporary stack, constructs a minimal identity-mapped page table (one PML4, one PDPT, one 1 GiB large page), enables PAE, sets the long-mode bit in the `EFER` MSR, loads `CR3`, enables paging, and performs a far jump into 64-bit code.
+- **`longmode.s`** sets up 64-bit segment registers, switches to the permanent kernel stack, and calls `k64_kernel_main()`.
+
+Nothing above this layer needs to think about protected mode or page-table bootstrapping. The entry paging setup is intentionally minimal — just enough to run the kernel image in long mode.
+
+### Layer 2: Core Kernel Runtime
+
+`k64_kernel_main()` in `k64_kernel.c` is the single linear bring-up function. Its initialization order is fixed and explicit:
+
+<Steps>
+  <Step title="Terminal init and boot screen">
+    `k64_term_init()` and `k64_term_draw_boot_screen()` bring up VGA text mode output and render the boot status display.
+  </Step>
+  <Step title="Config parsing">
+    `k64_config_init()` reads boot-time keys from the GRUB Multiboot command line: `pit_hz`, `log_level`, and `boot_mode`.
+  </Step>
+  <Step title="Log-level setup">
+    `k64_log_set_level()` applies the parsed log level so subsequent output is filtered correctly.
+  </Step>
+  <Step title="Banner output">
+    `k64_banner()` prints the kernel version string and copyright notice to the terminal.
+  </Step>
+  <Step title="Multiboot magic validation">
+    The kernel verifies that `k64_mb_magic == 0x2BADB002`. If the check fails, it calls `k64_panic()`.
+  </Step>
+  <Step title="IDT initialization">
+    `k64_idt_init()` builds and loads the 64-bit Interrupt Descriptor Table, installing ISR and IRQ stubs for all hardware exception and interrupt vectors.
+  </Step>
+  <Step title="PIC remap">
+    `k64_pic_remap()` moves the legacy 8259 PIC off the CPU exception vectors so hardware IRQs do not collide with CPU fault numbers.
+  </Step>
+  <Step title="PMM initialization">
+    `k64_pmm_init()` builds the bitmap-based physical frame allocator from the Multiboot memory map and marks all reserved regions.
+  </Step>
+  <Step title="VMM initialization">
+    `k64_vmm_init()` sets up per-service virtual memory slot tracking so that services and ELF executables can later receive private `CR3` roots.
+  </Step>
+  <Step title="Scheduler initialization">
+    `k64_sched_init()` readies the priority-aware cooperative task scheduler. SSE state handling and the user-mode gate are also initialized here.
+  </Step>
+  <Step title="Module registry init">
+    `k64_modules_registry_init()` initializes the driver registry capable of tracking up to 32 driver entries.
+  </Step>
+  <Step title="Service registry init">
+    `k64_system_registry_init()` initializes the service registry, also capped at 32 entries.
+  </Step>
+  <Step title="Registration of the core kernel service">
+    `k64_system_register_core_services()` registers the built-in `kernel` service (PID 0) and its owned command surface.
+  </Step>
+  <Step title="PIT initialization">
+    `k64_pit_init(k64_config.pit_hz)` programs the 8253/8254 Programmable Interval Timer to the configured tick frequency (default: 1000 Hz).
+  </Step>
+  <Step title="Driver module registration and bootstrap">
+    `k64_modules_init()` and `k64_modules_bootstrap()` register built-in drivers (`screen`, `keyboard`, `fs`, `rtl8139`, `e1000`) and autostart them. `k64_modules_load_rootfs()` then scans `/k64m` for native `.k64m` files on the mounted filesystem and bootstraps again.
+  </Step>
+  <Step title="System service registration and bootstrap">
+    `k64_system_init()` and `k64_system_bootstrap()` register and start all built-in services. The `init` service performs one-shot bootstrap work (starting `servicectl`, `driverctl`, `storagectl`, `fsctl`, `userctl`, and `shell`) and then stops.
+  </Step>
+  <Step title="Basic self-test">
+    `k64_selftest()` runs a minimal sanity assertion check and logs the result.
+  </Step>
+  <Step title="`sti` — enable interrupts">
+    The kernel executes `sti` to unmask hardware interrupts and allow the PIT to begin driving the scheduler.
+  </Step>
+  <Step title="Entry into the runtime dispatcher loop">
+    The kernel enters a `for(;;)` loop calling `k64_modules_poll_async()` and `k64_system_poll_async()`. Async drivers and services run as scheduled worker tasks; the CPU halts with `hlt` between timer ticks.
+  </Step>
+</Steps>
+
+### Layer 3: Drivers (`.k64m`) and Services (`.k64s`)
+
+Above the kernel core, K64 uses two registry-backed runtime control planes:
+
+- **Drivers (`.k64m`)** model hardware and low-level runtime providers. Built-in drivers include `screen`, `keyboard`, `fs`, `rtl8139`, and `e1000`. Async drivers are launched as scheduled worker tasks. The `driverctl` service exposes runtime driver management.
+- **Services (`.k64s`)** are the primary unit of user-visible behavior. They own shell command registrations, session state, and control-plane logic. Built-in services include `init`, `servicectl`, `driverctl`, `storagectl`, `netctl`, `kpm`, `fsctl`, `userctl`, `sysfetch`, `uname`, `k64cc`, `elfctl`, and `shell`. The `servicectl` service exposes runtime service management.
+
+Both artifact types have two loading paths: built-in compiled-in implementations, and native rootfs-binary files discovered under `/k64m` and `/k64s` after the filesystem driver mounts `K64XFS`.
+
+### Layer 4: Root Filesystem (K64XFS)
+
+The running system prefers a writable `K64XFS` image on a block device (ATA-backed `build/root.disk` in the default QEMU flow) and falls back to a Multiboot module `root.xfs` when no persistent root is available, or to a tiny in-memory fallback tree if neither is present.
+
+The root filesystem contains all user-visible paths and system artifacts:
+
+```text
+/boot/k64-kernel-v<version>.elf
+/boot/grub/grub.cfg
+/k64s/*.k64s
+/k64m/*.k64m
+/ex/*.elf
+/etc/
+/usr/
+/tmp/
+```
+
+GRUB itself reads `K64XFS` through the custom `grub/k64xfs.c` module, so the ISO bootstrap path can hand off to the boot configuration stored inside the root filesystem.
+
+## Central Design Principle: Mechanism vs. Policy
+
+The organizing principle throughout the K64 codebase is:
+
+> **The kernel owns bootstrapping, interrupt/timer infrastructure, memory allocators, and registries. Command behavior is delegated outward to services.**
+
+This means:
+
+- Low-level platform work (IDT, PIC, PIT, PMM, VMM, scheduler) lives in `k64_*.c` kernel source.
+- Shell commands, filesystem operations, network control, user management, and package management are all implemented as service-registered command handlers — not as hard-coded kernel logic.
+- Extending K64 means adding service definitions in `k64s_def/` or driver definitions in `k64m_def/`, not modifying the kernel core for each new capability.
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card title="Boot Pipeline" icon="rocket" href="/architecture/boot">
+    GRUB to `k64_kernel_main`: the full low-level path from ISO bootstrap through long-mode entry.
+  </Card>
+  <Card title="Memory Management" icon="memory" href="/architecture/memory">
+    Bitmap PMM and per-service VMM with private CR3 roots.
+  </Card>
+  <Card title="Scheduler" icon="clock" href="/architecture/scheduler">
+    Priority-aware cooperative task scheduling driven by PIT ticks.
+  </Card>
+  <Card title="Driver Model" icon="microchip" href="/runtime/driver-model">
+    The `.k64m` artifact format, built-in vs. rootfs-native loading, and `driverctl`.
+  </Card>
+  <Card title="Service Model" icon="server" href="/runtime/service-model">
+    The `.k64s` artifact format, service classes, PID ranges, and `servicectl`.
+  </Card>
+  <Card title="K64XFS" icon="folder" href="/filesystem/k64xfs">
+    The custom root filesystem format shared by the kernel runtime and GRUB.
+  </Card>
+</CardGroup>
+
+## Honest Scope Note
+
+<Note>
+K64 is an experimental kernel. It is not a full Unix-style process runtime, is not POSIX-complete, and is not UEFI-ready. It targets BIOS/GRUB-style Multiboot on QEMU and compatible legacy hardware. Some subsystems — particularly kernel hot-reload and full timer-preemptive ring-3 context switching — are reserved or partially implemented rather than fully realized. The boundaries described on these pages reflect what the code does today.
+</Note>
