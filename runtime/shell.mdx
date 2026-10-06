@@ -1,7 +1,7 @@
 ---
 title: "K64 Interactive Shell: Service-Backed Command Line"
 sidebarTitle: "Shell"
-description: "The K64 shell is a managed async service with PS/2 and serial input, command history, cursor editing, keyboard layout switching, and a four-stage command dispatch chain."
+description: "The K64 shell is a managed async service accepting PS/2 and serial input, with command history, cursor editing, layout switching, and four-stage dispatch."
 ---
 
 The K64 shell is not a hard-coded foreground loop in the kernel core. It is a managed async service named `shell`, registered and started by `init` like any other service in the K64 runtime. Its lifecycle callbacks (`k64_shell_service_start`, `k64_shell_service_stop`, `k64_shell_service_poll`) are declared in `k64_shell.h`, and the PIT-driven scheduler calls its poll function on each tick — meaning the shell coexists with async drivers, network polling, and other service workers rather than monopolising the CPU in a blocking spin loop.

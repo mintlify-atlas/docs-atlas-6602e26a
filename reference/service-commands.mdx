@@ -1,7 +1,7 @@
 ---
-title: "K64 Service Command Reference: servicectl, driverctl, netctl, and More"
+title: "K64 Service Commands: Shell APIs and Service Control"
 sidebarTitle: "Service Commands"
-description: "Reference for all K64 service-registered shell commands: servicectl, driverctl, storagectl, netctl, userctl, kpm, reload, sysfetch, uname, k64cc, elfrun, klcs, and fsctl."
+description: "Reference for K64 service-registered commands: servicectl, driverctl, storagectl, netctl, userctl, kpm, reload, sysfetch, uname, k64cc, and elfrun."
 ---
 
 Service commands are not hard-coded into the shell. Each one is registered by a running service through `k64_system_register_command()` and dispatched from the shell via `k64_system_dispatch_command()`. When you type a command that is not a shell built-in, the shell asks the service registry whether any running service owns that name and, if so, calls its handler directly. The sections below document every command surface exposed by the built-in services, organized by owning service.

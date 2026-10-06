@@ -1,7 +1,7 @@
 ---
 title: "K64 Block Storage: ATA, MBR Partitions, and storagectl"
 sidebarTitle: "Storage"
-description: "K64's block layer registers ATA PIO disks and MBR partitions, exposes them through storagectl, and supports installing the K64XFS root filesystem to a persistent target disk."
+description: "K64's block layer registers ATA PIO disks and MBR partitions, exposes them through storagectl, and supports installing K64XFS to a persistent disk."
 ---
 
 K64's storage subsystem is organized as a thin block-device abstraction layer over an ATA PIO hardware driver, with partition views layered on top of whole-disk devices and a K64XFS filesystem driver that mounts from the first suitable partition found at boot. The runtime control surface is the `storagectl` service, which lets you inspect disks, partition them, check filesystem capacity, flush writes, and install K64 to a persistent target disk.

@@ -1,7 +1,7 @@
 ---
-title: "K64 User and Permission System: Accounts, Groups, and Privilege"
+title: "K64 User and Permission System: Accounts and Groups"
 sidebarTitle: "Users & Permissions"
-description: "K64 implements a POSIX-like multiuser model with hashed passwords, UID/GID identity, mode-bit permission checks, sudo elevation, and the userctl service command surface."
+description: "K64 implements a POSIX-like multiuser model with hashed passwords, UID/GID identity, mode-bit checks, sudo elevation, and the userctl command surface."
 ---
 
 K64's user and privilege system is implemented as the `userctl` service rather than as a hard-coded kernel subsystem. Accounts and groups are loaded from two plain text files in `/etc/`, and the kernel tracks numeric UID/GID identity at runtime to enforce owner/group/other mode-bit checks on filesystem operations, service management, ELF execution, and shell commands. The design is intentionally POSIX-like in structure while remaining lightweight enough to fit K64's experimental kernel scope.
@@ -110,6 +110,8 @@ K64 enforces a layered privilege model through the `k64_user_can_*` API:
 | `groupdel <group>` | Delete a group (if not essential or used as a primary group) | `groupdel staff` |
 | `gpasswd add <group> <user>` | Add a user to a group | `gpasswd add staff guest` |
 | `gpasswd del <group> <user>` | Remove a user from a group | `gpasswd del staff guest` |
+| `chmod <mode> <path>` | Update mode bits (effective root only) | `chmod 0644 /tmp/note` |
+| `chown <user>:<group> <path>` | Update runtime owner and group (effective root only) | `chown alice:staff /tmp/note` |
 
 ## Usage Examples
 
@@ -123,6 +125,7 @@ useradd alice hunter2 sudo staff
 groupadd staff
 gpasswd add staff guest
 usermod role alice root
+usermod primary alice root
 passwd alice newpass
 ```
 

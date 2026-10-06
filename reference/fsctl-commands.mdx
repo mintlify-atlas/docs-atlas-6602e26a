@@ -1,7 +1,7 @@
 ---
-title: "K64 Filesystem Command Reference: fsctl, xfsctl, and Shell File Ops"
+title: "K64 Filesystem Commands: fsctl, xfsctl, and File Ops"
 sidebarTitle: "Filesystem Commands"
-description: "Complete reference for K64 filesystem shell commands, fsctl service commands for runtime filesystem operations, and xfsctl for disk image tooling and diagnostics."
+description: "Reference for K64 shell filesystem commands, fsctl service operations, and xfsctl low-level K64XFS tooling for disk image formatting and diagnostics."
 ---
 
 K64 exposes filesystem operations through three distinct surfaces: standard shell file operations registered by the `fsctl` service, the `xfsctl` service for low-level K64XFS disk image tooling and diagnostics, and `storagectl` for volume-level operations against the mounted root. All commands operate on the K64XFS (`K64XFS`) filesystem — the standard K64 root format used by both the kernel and the GRUB-side module. Changes are held in a 64-block write-back cache and must be explicitly flushed with `sync` to persist to the backing block device.

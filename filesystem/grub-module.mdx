@@ -1,5 +1,5 @@
 ---
-title: "K64XFS GRUB Module: Booting from a K64 Filesystem"
+title: "K64XFS GRUB Module: Boot Directly from a K64 Filesystem"
 sidebarTitle: "GRUB Module"
 description: "The k64xfs GRUB module lets GRUB mount K64XFS images, enumerate directories, and load grub.cfg and the kernel ELF directly from the root filesystem."
 ---
@@ -37,14 +37,14 @@ This means the persistent disk is the authoritative source of boot configuration
 
 ## Build Process
 
-The GRUB module is built by the helper script `tools/build_grub_k64xfs.sh`. It compiles `grub/k64xfs.c` against GRUB's internal headers and links it as a GRUB module.
+The GRUB module is built by the helper script `tools/build_grub_k64xfs.sh`. It compiles `grub/k64xfs.c` against GRUB's internal headers and links it as a GRUB module. The normal way to build it is through `make`, which passes the required platform and work directories to the script automatically:
 
 ```bash
-# Default build (GRUB source expected at /tmp/grub-src)
-tools/build_grub_k64xfs.sh
+# Build the full ISO (includes the GRUB module)
+make
 
-# Override GRUB source path
-GRUB_SRC=/path/to/grub-src tools/build_grub_k64xfs.sh
+# Override GRUB source path (default is /tmp/grub-src)
+GRUB_SRC=/path/to/grub-src make
 ```
 
 The compiled module is written to:
@@ -53,7 +53,7 @@ The compiled module is written to:
 build/grub/i386-pc/k64xfs.mod
 ```
 
-The main `Makefile` calls this script as part of the ISO creation flow. If you are building the GRUB module independently, make sure GRUB source headers are available at the path the script expects, or set `GRUB_SRC` to override it.
+The main `Makefile` invokes `tools/build_grub_k64xfs.sh` as part of the ISO creation flow. Make sure GRUB source headers are available at the path the script expects, or set `GRUB_SRC` to override it.
 
 <Note>
 `GRUB_SRC` defaults to `/tmp/grub-src`. If you have cloned the GRUB source tree elsewhere, set the environment variable before invoking the build script or running `make`.

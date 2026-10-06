@@ -1,7 +1,7 @@
 ---
 title: "KPM: K64 Package Manager Client for .kpg Binary Packages"
 sidebarTitle: "KPM"
-description: "KPM is K64's package manager client. It downloads binary .kpg packages from a plain HTTP repository, validates CRC32, and installs ELF, .k64s, or .k64m payloads into the running system."
+description: "KPM downloads binary .kpg packages from a plain HTTP repository, validates CRC32, and installs ELF, .k64s, or .k64m payloads into the running system."
 ---
 
 KPM is the K64 Package Manager client, implemented as the `kpm` service and registered as a shell command surface. It downloads binary `.kpg` packages from a plain HTTP repository server, validates header fields and a CRC32 checksum, and installs the payload into the live running system. KPM is a **client only**: K64 does not host or generate the external repository server — you point KPM at an already-running static HTTP source.

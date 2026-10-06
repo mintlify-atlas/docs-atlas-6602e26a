@@ -1,7 +1,7 @@
 ---
-title: "K64: A Service-Native 64-bit Experimental Kernel"
+title: "K64: An Experimental 64-bit x86_64 Kernel Overview"
 sidebarTitle: "Introduction"
-description: "K64 is an experimental GRUB-booted x86_64 kernel with a custom K64XFS filesystem, registry-based driver/service runtime, ring-3 ELF execution, networking, and a Linux compatibility layer."
+description: "K64 is an experimental x86_64 kernel with K64XFS, registry-based drivers and services, ring-3 ELF execution, networking, and a Linux compatibility layer."
 ---
 
 K64 is a small experimental 64-bit kernel for x86_64. It boots through GRUB, switches into long mode, brings up a compact runtime, and then hands most policy to a driver and service layer built around `.k64m` and `.k64s` artifacts. This page describes what K64 is, what it is not, how its major subsystems relate to each other, and where the current boundaries are.

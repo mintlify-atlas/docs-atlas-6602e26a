@@ -1,7 +1,7 @@
 ---
 title: "KLCS: K64 Linux Compatibility Service for x86_64 ELFs"
 sidebarTitle: "KLCS"
-description: "KLCS routes Linux x86_64 syscall frames into native K64 service calls, enabling static and dynamically-linked Linux ELFs like tcc, git, nano, and sl to run on K64."
+description: "KLCS routes Linux x86_64 syscall frames into native K64 service calls, letting static and dynamic Linux ELFs like tcc, git, nano, and sl run on K64."
 ---
 
 KLCS is the K64 Linux Compatibility Service. It does not make K64 a Linux clone — it routes Linux application behavior into native K64 service calls, so K64 stays native by design and compatible by service. A Linux x86_64 ELF running under KLCS never sees real Linux kernel internals; it sees a K64-native service call translated response, an errno value translated from a K64 status code, and a path rooted inside the KLCS compatibility tree. The compatibility boundary is intentionally service-oriented: the kernel only needs to identify a Linux-personality process, collect the x86_64 syscall frame, and hand it to the `klcs` service.

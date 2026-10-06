@@ -1,7 +1,7 @@
 ---
 title: "K64 Service Model: .k64s Artifacts and Service-Call ABI"
 sidebarTitle: "Service Model"
-description: "K64 services are .k64s binary artifacts with PID-class namespacing, command dispatch, lifecycle callbacks, and a typed service-call ABI for userland and kernel consumers."
+description: "K64 services are .k64s binary artifacts with PID-class namespacing, command dispatch, lifecycle hooks, and a typed service-call ABI for userland consumers."
 ---
 
 Services are the primary unit of runtime behavior above the kernel core in K64. Everything from filesystem commands and network control to the interactive shell is a named service registered in a fixed table of up to 32 entries. Services are packaged as `.k64s` binary artifacts and can be built-in (compiled into the kernel image), loaded from `/k64s` on the mounted K64XFS root, or delivered as Multiboot modules on the legacy path. On top of lifecycle callbacks, services can register shell-visible commands and typed service-call methods reachable from both other services and userland programs via the `service_call` syscall.
@@ -144,9 +144,11 @@ All of the following are registered by `k64s_builtin.c` and started by `init`:
 | `kpm` | K64 Package Manager: source management, package listing, version query, and install |
 | `reload` | Runtime reload request surface (`reload drivers`, `reload kernel`) |
 | `fsctl` | Read/write filesystem command surface (ls, cat, write, mkdir, stat, chmod, …) |
+| `xfsctl` | K64XFS debugging and tooling surface (format, check, inspect, and exercise K64XFS) |
 | `userctl` | User/session/privilege management (login, sudo, useradd, groups, …) |
 | `sysfetch` | System information display (ASCII art + kernel, memory, and filesystem stats) |
 | `uname` | Kernel identity output (`K64 k64-kernel-v<version> x86_64`) |
+| `klcs` | K64 Linux Compatibility Service: Linux x86_64 syscall gate and dynamic ELF loader bridge |
 | `k64cc` | In-system builder for stub ELF, `.k64s`, and `.k64m` scaffolds |
 | `elfctl` | Explicit ELF execution via `elfrun </path/to/file.elf>` |
 | `shell` | Interactive command-line service backed by PS/2 and serial input |

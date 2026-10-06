@@ -1,7 +1,7 @@
 ---
 title: "K64 Boot Configuration: GRUB Multiboot Command Line Keys"
 sidebarTitle: "Boot Config"
-description: "K64 parses three keys from the GRUB Multiboot command line at boot time: pit_hz, log_level, and boot_mode. Covers defaults, valid values, and example GRUB config entries."
+description: "K64 reads three GRUB Multiboot keys: pit_hz, log_level, and boot_mode. Covers defaults, valid values, and GRUB menu entry examples."
 ---
 
 K64 reads its runtime configuration from the GRUB Multiboot kernel command line, parsed in `k64_config.c` at the very start of `k64_kernel_main()` before any subsystem is initialized. The parsed values are stored in the global `k64_config_t` struct declared in `k64_config.h` and referenced throughout the kernel for timer frequency, log verbosity, and boot behavior. There are exactly three recognized keys; unknown keys are ignored silently.

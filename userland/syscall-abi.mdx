@@ -1,7 +1,7 @@
 ---
-title: "K64 Userland Syscall ABI and Service-Call Gate"
+title: "K64 Userland Syscall ABI and Ring-3 Service-Call Gate"
 sidebarTitle: "Syscall ABI"
-description: "K64's userland ABI centers on syscall 25 (service_call), a typed gate that dispatches named service methods from ring-3 processes into native K64 services."
+description: "K64's public userland ABI is syscall 25 (service_call), a typed gate routing named service methods from ring-3 processes into native K64 services."
 ---
 
 K64's ring-3 userland communicates with the kernel through a single public syscall gate. Rather than exposing dozens of feature-specific syscall numbers, K64 consolidates all user-to-kernel communication into syscall 25 (`service_call`), a typed dispatch gate that routes named service methods — such as `io.write`, `proc.spawn`, or `sched.sleep` — from ring-3 user programs into native K64 services. All older syscall numbers (0–24) are no longer public userland ABI and return `K64_ERR_NOSYS`.

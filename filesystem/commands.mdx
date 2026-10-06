@@ -1,7 +1,7 @@
 ---
 title: "K64XFS Filesystem Commands: fsctl, xfsctl, and Shell Ops"
 sidebarTitle: "Commands"
-description: "Complete reference for K64 filesystem shell commands: fsctl, xfsctl, and standard shell operations for directory traversal, file I/O, permissions, and sync."
+description: "Complete reference for K64 filesystem commands: fsctl, xfsctl, and shell operations for directory traversal, file I/O, permissions, and volume sync."
 ---
 
 K64 exposes its filesystem through three overlapping command surfaces: a set of shell-native file commands registered by the `fsctl` service, an `fsctl` service command group for read/write operations including permission management, and an `xfsctl` tooling surface aimed at formatting, inspecting, and exercising K64XFS volumes directly. All three surfaces operate on the same mounted K64XFS root. Changes made through any surface are reflected immediately and can be flushed to the backing block device with `sync`.

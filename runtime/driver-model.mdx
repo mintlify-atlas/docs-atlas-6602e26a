@@ -1,7 +1,7 @@
 ---
-title: "K64 Driver Model: .k64m Binary Artifacts"
+title: "K64 Driver Model: .k64m Artifacts and Driver Registry"
 sidebarTitle: "Driver Model"
-description: "K64 drivers are .k64m binary artifacts registered in a runtime registry of up to 32 entries. Covers the legacy external format, native rootfs format, lifecycle, and driverctl commands."
+description: "K64 drivers are .k64m binary artifacts in a 32-entry runtime registry. Covers k64_driver_t fields, flags, lifecycle, built-ins, and driverctl commands."
 ---
 
 K64 drivers are the lowest runtime layer above the kernel core. Every hardware abstraction and low-level service provider — screen output, keyboard input, filesystem mounting, and Ethernet I/O — is modelled as a named driver entry registered in a fixed runtime table. Drivers are packaged as `.k64m` binary artifacts, either compiled directly into the kernel image as built-ins or loaded from `/k64m` on the mounted K64XFS root. The `driverctl` service gives you a live control plane to list, start, stop, and restart any registered driver from the shell.

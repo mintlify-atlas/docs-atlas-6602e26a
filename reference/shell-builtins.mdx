@@ -1,7 +1,7 @@
 ---
-title: "K64 Shell Built-in Commands Reference"
+title: "K64 Shell Built-in Commands: Complete Reference Guide"
 sidebarTitle: "Shell Builtins"
-description: "Complete reference for K64 shell built-in commands: help, clear, ps, sched, task, ticks, serial, layout, echo, yield, reboot, shutdown, panic."
+description: "Reference for all 13 K64 shell built-in commands: help, clear, ticks, task, ps, serial, sched, echo, layout, yield, panic, reboot, and shutdown."
 ---
 
 The K64 shell service owns a fixed set of built-in commands that are parsed and dispatched directly, before the service command registry is ever consulted. These built-ins are defined in `k64_shell_cmd.h` and handled in `k64_shell_cmd.c`. Every command that falls outside this list travels through the four-stage dispatch chain: service command registry → service start-by-name → driver start-by-name → path resolver (`/etc/path/inpath.cfg`).

@@ -1,7 +1,7 @@
 ---
-title: "K64 ELF64 Loader: Ring-3 User Process Execution"
+title: "K64 ELF64 Loader: Ring-3 Programs and Ring-0 Modules"
 sidebarTitle: "ELF Loader"
-description: "K64's minimal ELF64 loader supports ET_EXEC and ET_DYN x86_64 images, maps PT_LOAD segments into isolated VM spaces, and launches /ex/*.elf programs in ring 3."
+description: "K64's minimal ELF64 loader maps ET_EXEC and ET_DYN x86_64 images into isolated VM spaces and enters /ex/*.elf programs in ring 3 via iretq."
 ---
 
 K64 includes a real minimal ELF64 loader for filesystem-backed executables. Programs stored in `/ex` on K64XFS are loaded into isolated virtual memory spaces and entered in ring 3 through an `iretq`-based user-mode transition. ELF-backed service and driver modules use a separate kernel-side call path through the same loader infrastructure. The result is a split execution model: user-facing programs run with true ring-3 privilege separation, while kernel-managed modules remain behind the kernel boundary.

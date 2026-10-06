@@ -1,7 +1,7 @@
 ---
-title: "Building K64 from Source"
+title: "K64 Build Reference: Makefile, Flags, and Toolchain"
 sidebarTitle: "Building"
-description: "Toolchain requirements, Makefile targets, compiler flags, rootfs staging flow, ISO creation, and QEMU run options for building K64."
+description: "Toolchain detection, CFLAGS64 flags, every Makefile target, rootfs staging pipeline, ISO creation, and environment variables for building K64 from source."
 ---
 
 K64 is built entirely from a single `Makefile`. It produces a bootable ISO (`k64.iso`), a persistent disk image (`build/root.disk`), and all the binary `.k64s` service and `.k64m` driver modules that end up inside the root filesystem. This page documents the toolchain requirements, every important compiler flag, the rootfs staging pipeline, the ISO creation flow, and all configurable environment variables.

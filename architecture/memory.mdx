@@ -1,7 +1,7 @@
 ---
-title: "K64 Memory Management: PMM and VMM"
+title: "K64 Memory Management: Bitmap PMM and Per-Service VMM"
 sidebarTitle: "Memory"
-description: "K64 uses a bitmap-based physical memory manager (PMM) and a per-space virtual memory manager (VMM) that assigns isolated page-table roots to services and ELF processes."
+description: "K64 uses a bitmap PMM for physical frames and a per-space VMM that assigns isolated page-table roots and private CR3 roots to services and ELF processes."
 ---
 
 K64's memory management is split across two subsystems with distinct responsibilities. The Physical Memory Manager (PMM) tracks which 4 KiB frames of physical RAM are in use and allocates or frees them. The Virtual Memory Manager (VMM) builds per-service and per-process page-table trees, assigns each one a private `CR3`, and maps ELF program segments and user pages into those isolated address spaces. Neither subsystem is meant to be general-purpose — both are sized and scoped to match what the K64 service/driver runtime actually needs today.
@@ -71,6 +71,9 @@ From `k64_vmm.h`:
 
 ```c
 void k64_vmm_init(void);
+
+/* Map a physical MMIO range into the kernel address space. */
+void* k64_vmm_map_mmio(uint64_t phys_addr, size_t size);
 
 /* Allocate a service-mode (ring-0) VM space for the given PID. */
 bool k64_vmm_alloc_service_space(uint64_t pid, k64_vm_space_t* out_space);

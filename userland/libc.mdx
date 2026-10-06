@@ -1,7 +1,7 @@
 ---
-title: "K64 Native Userland libc: Minimal C Runtime for Ring-3 Programs"
+title: "K64 Native Userland libc: Freestanding C Runtime Seed"
 sidebarTitle: "Userland libc"
-description: "K64's thin freestanding libc covers crt0 startup, service-call wrappers for I/O and process control, fd operations, string/memory helpers, and a set of ring-3 smoke programs."
+description: "K64's thin freestanding libc provides crt0 startup, service-call wrappers for I/O and process control, string/memory helpers, and ring-3 smoke programs."
 ---
 
 K64's libc seed is intentionally tiny. It is the first stable nongraphical ABI surface for growing a real K64 userland without writing every program in assembly. Rather than implementing a full C standard library, it provides exactly what is needed to write useful ring-3 programs today: a `_start` entry point, wrappers around the `service_call` syscall gate for common operations, process and fd control helpers, and a small set of string and memory utilities. Sample programs built with it serve as both smoke tests and reference implementations.
@@ -21,14 +21,20 @@ User programs are compiled with a dedicated set of freestanding flags from the M
 
 ```text
 -ffreestanding
+-O2
+-Wall
+-Wextra
 -fno-stack-protector
+-fno-builtin
 -fno-pic
 -fno-pie
 -mno-red-zone
+-mno-mmx
 -mno-sse
+-mno-sse2
 ```
 
-These flags ensure that the compiled programs do not depend on kernel-provided stack cookies, position-independent code helpers, the red-zone scratch area (which would conflict with interrupt delivery in ring 3), or SSE registers (which the K64 kernel does not save/restore on context switches).
+These flags ensure that the compiled programs do not depend on kernel-provided stack cookies, built-in function replacements, position-independent code helpers, the red-zone scratch area (which would conflict with interrupt delivery in ring 3), or MMX/SSE registers (which the K64 kernel does not save/restore on context switches).
 
 ## What libc Provides
 
@@ -57,33 +63,30 @@ The raw service-call interface is also directly available:
 
 ```c
 int64_t k64_service_call(const char* service, const char* method,
-                         const void* req, uint64_t req_len,
-                         void* resp, uint64_t resp_len);
+                         const void* request, uint64_t request_len,
+                         void* response, uint64_t response_len);
 
-int64_t k64_service_call_ex(const char* service, const char* method,
-                             const void* req, uint64_t req_len,
-                             void* resp, uint64_t resp_len,
-                             uint64_t flags);
+int64_t k64_service_call_ex(const k64_service_call_user_t* call);
 ```
 
 ### Process Wrappers
 
 ```c
-bool     proc_info(uint64_t pid, k64_proc_info_t* out);
-int64_t  waitpid(uint64_t pid, int64_t* exit_code);
-int64_t  waitpid_flags(uint64_t pid, int64_t* exit_code, uint64_t flags);
+int64_t  k64_proc_info(uint64_t pid, k64_proc_info_t* info);
+int64_t  k64_waitpid(uint64_t pid, int64_t* exit_code);
+int64_t  k64_waitpid_flags(uint64_t pid, int64_t* exit_code, uint64_t flags);
 ```
 
-`waitpid_flags` accepts `K64_WAIT_BLOCK` (wait until child exits) or `K64_WAIT_NOHANG` (return `K64_ERR_AGAIN` immediately if child is still running).
+`k64_waitpid_flags` accepts `K64_WAIT_BLOCK` (wait until child exits) or `K64_WAIT_NOHANG` (return `K64_ERR_AGAIN` immediately if child is still running).
 
 ### String and Memory Helpers
 
 The libc includes minimal freestanding implementations of:
 
-- String: `k64_strlen`, `k64_strcpy`, `k64_strncpy`, `k64_strcmp`, `k64_strncmp`, `k64_strchr`, `k64_strcat`
+- String: `k64_strlen`, `k64_strcpy`, `k64_strncpy`, `k64_strcmp`, `k64_strncmp`, `k64_strcat`
 - Memory: `k64_memset`, `k64_memcpy`, `k64_memcmp`
-- Numeric output: decimal and hexadecimal integer-to-string formatting helpers
-- Console helpers: `k64_putstr`, `k64_putchar`, `k64_putuint`, `k64_puthex`
+- Numeric output: `k64_put_u64`, `k64_put_i64`, `k64_put_hex64` (decimal and hexadecimal integer output)
+- Console helpers: `k64_puts`, `k64_putc`
 
 These helpers are freestanding — no dependency on the host C library.
 

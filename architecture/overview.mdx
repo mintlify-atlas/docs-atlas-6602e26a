@@ -1,7 +1,7 @@
 ---
-title: "K64 Runtime Architecture: Layers and Design Goals"
+title: "K64 Runtime Architecture: Layers and Design Principles"
 sidebarTitle: "Overview"
-description: "Four-layer runtime architecture: boot/CPU setup, core kernel runtime, driver/service control planes, and K64XFS root filesystem. Explains the mechanism-vs-policy split."
+description: "Four-layer runtime: boot/CPU setup, core kernel runtime, driver/service control planes, and K64XFS root filesystem with a mechanism-vs-policy design."
 ---
 
 K64 is a small experimental 64-bit kernel for x86_64. Its runtime is deliberately organized in layers: the kernel core does the minimum needed to bring up the machine and hand authority outward, while drivers, services, and the root filesystem carry most user-visible behavior. This page describes how those layers connect, what each one owns, and where the current boundaries still are.

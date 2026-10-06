@@ -1,7 +1,7 @@
 ---
-title: "K64 Cooperative Scheduler and Task Model"
+title: "K64 Priority Scheduler: Task Model and PIT-Driven Dispatch"
 sidebarTitle: "Scheduler"
-description: "K64's priority-aware cooperative scheduler drives async driver and service worker tasks using PIT timer ticks, with aging-based fairness and yield/sleep support."
+description: "PIT-driven priority scheduler running async drivers and service workers as tasks, with wait-tick aging so no runnable task is permanently starved."
 ---
 
 K64's scheduler is the mechanism that keeps async drivers and services running after `k64_kernel_main()` completes initialization. It is driven by PIT timer interrupts and uses a priority-aware picking algorithm with aging-based fairness — higher-priority work is preferred, but no runnable task is permanently starved. This page describes how the scheduler works, what the task model looks like, and what the scheduler is not.

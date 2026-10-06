@@ -1,7 +1,7 @@
 ---
 title: "K64XFS: Block-Backed Filesystem Format and Architecture"
 sidebarTitle: "K64XFS"
-description: "K64XFS is K64's custom 4096-byte block filesystem with versioned superblock, inode/block bitmaps, direct extents, 64-block cache, POSIX-like metadata, and a metadata journal skeleton."
+description: "K64XFS is K64's native root filesystem: 4096-byte blocks, versioned superblock, inode and block bitmaps, direct extents, and a 64-entry dirty block cache."
 ---
 
 K64XFS is the native filesystem format for the K64 kernel. It is a block-backed, fixed-block-size filesystem designed to be readable by GRUB at boot time, writable by the kernel at runtime, and buildable deterministically on the host from a staged directory tree. K64XFS is used by the kernel's runtime filesystem driver, the GRUB-side filesystem module, the persistent disk image attached as `build/root.disk` in the default QEMU flow, and the ISO fallback module `root.xfs`. Every root path that K64 operates on — boot artifacts, service binaries, user files — lives inside a K64XFS volume.
@@ -29,8 +29,8 @@ K64XFS v1 uses fixed 4096-byte filesystem blocks. The first few block numbers ar
 | Block 0 | Checksummed superblock (magic, version, geometry, feature flags, UUID, label, root inode, mount state, checksum) |
 | Block 1 | Inode bitmap (one bit per inode slot; up to 512 inodes in v1) |
 | Block 2 | Block bitmap (one bit per filesystem block) |
-| Blocks 3–10 | Journal area (32 blocks reserved; `K64XFS_JOURNAL_BLOCKS = 32`) |
-| Blocks 35 onward | Fixed inode table (size determined by `MAX_INODES × sizeof(inode)` rounded up to block boundaries) |
+| Blocks 3–10 | Journal area |
+| Blocks 11 onward | Fixed inode table (size determined by `MAX_INODES × sizeof(inode)` rounded up to block boundaries) |
 | Remaining blocks | File and directory data extents |
 
 <Note>

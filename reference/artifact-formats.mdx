@@ -1,7 +1,7 @@
 ---
-title: "K64 Artifact Formats: .k64m Driver and .k64s Service Binaries"
+title: "K64 .k64m and .k64s Artifact Formats Full Reference"
 sidebarTitle: "Artifact Formats"
-description: "Reference for the .k64m driver and .k64s service binary artifact formats, their packed header structures, execution kinds, flags, and the source definition (.drv/.svc) compile flow."
+description: "Reference for K64 .k64m driver and .k64s service binary formats, packed header structs, execution kinds, flags, and the .drv/.svc compile flow."
 ---
 
 `.k64m` and `.k64s` are the native binary module formats used by K64 for drivers and services respectively. They are the primary extensibility mechanism above the kernel core: the kernel discovers and loads these files from `/k64m/` and `/k64s/` in the mounted K64XFS root filesystem after startup, registering their metadata into the driver and service registries. Both formats are packed binary files generated at build time from human-readable source definitions in `k64m_def/*.drv` and `k64s_def/*.svc`. A third format, `.kpg`, is used by the KPM package manager to distribute and install `.k64m`, `.k64s`, and ELF payloads over HTTP.

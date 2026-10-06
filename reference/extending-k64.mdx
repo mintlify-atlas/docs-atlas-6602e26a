@@ -1,7 +1,7 @@
 ---
-title: "Extending K64: Adding Drivers, Services, and Userland Programs"
+title: "Extending K64: Add Drivers, Services, and Userland"
 sidebarTitle: "Extending K64"
-description: "Guide to K64's four main extension points: registering built-in drivers (k64m), built-in services (k64s), adding rootfs content, and writing native C userland programs."
+description: "How to extend K64 by adding drivers, services, rootfs content, and native C userland programs using the four main kernel extension points."
 ---
 
 K64's development model rests on a single organizing principle: **the kernel core owns mechanism; services and drivers own most policy and user-visible behavior.** Low-level platform work — interrupt handling, memory allocation, the scheduler, the block layer — lives in `k64_*.c`. Everything above that — commands, control planes, sessions, long-lived system functionality — belongs in a `.k64s` service or a `.k64m` driver. This separation is visible throughout the codebase and is the right mental model to keep in mind before adding anything new.

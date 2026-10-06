@@ -1,7 +1,7 @@
 ---
 title: "K64 Test Suite: Host Tests, Smoke Tests, and Unit Tests"
 sidebarTitle: "Testing"
-description: "K64's test suite covers shell command parsing, filesystem mutation, boot smoke, ring-3 ELF execution, persistence across reboots, networking, and GRUB config validation."
+description: "K64 test suite covering shell parsing, filesystem mutation, GRUB config, boot smoke, ring-3 ELF execution, persistence, and network behavior."
 ---
 
 K64's test suite is intentionally small and targeted. It does not aim for broad runtime verification — instead, it protects the packaging path, parser logic, filesystem mutation behavior, shell command surface, boot path, and the first user-mode execution path. The suite runs host-side C unit tests for fast parser and filesystem feedback, and Python-driven QEMU serial sessions for smoke coverage of everything that requires a real running kernel.
